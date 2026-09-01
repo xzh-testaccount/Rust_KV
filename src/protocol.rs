@@ -4,6 +4,7 @@ use crate::error::{AppError, ErrorCode, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 /// 包含LF的情况下, 请求响应的最大负载的字节数
 pub const MAX_FRAME_BYTES: usize = 65_536;
@@ -58,6 +59,62 @@ pub fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Frame> {
         };
 
         if let Some(consumed) = newline {
+            reader.consume(consumed);
+            if oversized {
+                return Ok(Frame::TooLarge);
+            }
+
+            let payload_len = frame
+                .len()
+                .saturating_sub(usize::from(frame.last() == Some(&b'\r')));
+            if payload_len > MAX_FRAME_BYTES {
+                return Ok(Frame::TooLarge);
+            }
+            frame.push(b'\n');
+            return Ok(Frame::Line(frame));
+        }
+        reader.consume(buffer_len);
+    }
+}
+
+/// 异步读取一个 JSON Lines 帧
+pub async fn read_frame_async<R>(reader: &mut R) -> io::Result<Frame>
+where
+    R: AsyncBufRead + Unpin, // Unpin 是必要的，因为内部会移动引用
+{
+    let mut frame = Vec::with_capacity(MAX_FRAME_BYTES + 1);
+    let mut oversized = false;
+
+    loop {
+        let (buffer_len, newline) = {
+            // 核心变化：await 异步等待数据到来
+            let buffer = reader.fill_buf().await?;
+            if buffer.is_empty() {
+                return Ok(if frame.is_empty() {
+                    Frame::Eof
+                } else {
+                    Frame::Incomplete
+                });
+            }
+
+            let mut newline = None;
+            for (index, byte) in buffer.iter().enumerate() {
+                if *byte == b'\n' {
+                    newline = Some(index + 1);
+                    break;
+                }
+
+                if frame.len() < MAX_FRAME_BYTES + 1 {
+                    frame.push(*byte);
+                } else {
+                    oversized = true;
+                }
+            }
+            (buffer.len(), newline)
+        };
+
+        if let Some(consumed) = newline {
+            // 消费数据也是异步方法
             reader.consume(consumed);
             if oversized {
                 return Ok(Frame::TooLarge);
