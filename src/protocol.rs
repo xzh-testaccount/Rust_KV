@@ -1,9 +1,9 @@
 //! Data types for the JSON Lines protocol.
 
 use serde::{Deserialize, Serialize};
-
+use serde::de::DeserializeOwned;
 use crate::error::{AppError, ErrorCode, Result};
-use std::io::{slef, BufRead};
+use std::io::{self, BufRead};
 
 /// Maximum request or response payload size, excluding the trailing LF.
 pub const MAX_FRAME_BYTES: usize = 65_536;
@@ -66,10 +66,11 @@ pub fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Frame> {
                 return Ok(Frame::TooLarge);
             }
 
-            let payload_len = frame.len()
+            let payload_len = frame
+                .len()
                 .saturating_sub(usize::from(frame.last() == Some(&b'\r')));
             if payload_len > MAX_FRAME_BYTES {
-                return Ok(Frame::Toolarge);
+                return Ok(Frame::TooLarge);
             }
             frame.push(b'\n');
             return Ok(Frame::Line(frame));
