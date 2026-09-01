@@ -58,25 +58,35 @@ fn main() {
     let temp = tempdir().unwrap();
     let wal_path = temp.path().join("benchmark.wal");
 
+    let mut store = PersistentStore::open(&wal_path).unwrap();
     let write_started = Instant::now();
-    {
-        let mut store = PersistentStore::open(&wal_path).unwrap();
-        for operation in 0..operations {
-            let key = format!("key:{:04}", operation % live_keys);
-            let value = format!("value:{operation:08}");
-            store.set(key, value).unwrap();
-        }
-        verify_final_state(&store, operations, live_keys);
+    for operation in 0..operations {
+        let key = format!("key:{:04}", operation % live_keys);
+        let value = format!("value:{operation:08}");
+        store.set(key, value).unwrap();
     }
+    verify_final_state(&store, operations, live_keys);
     let write_ms = write_started.elapsed().as_millis();
 
-    let wal_bytes = fs::metadata(&wal_path).unwrap().len();
+    let wal_bytes_before = fs::metadata(&wal_path).unwrap().len();
+    let compact_started = Instant::now();
+    let compact = store.compact().unwrap();
+    let compact_us = compact_started.elapsed().as_micros();
+    let snapshot_bytes = compact.snapshot_bytes;
+    drop(store);
+
+    let wal_bytes_after = fs::metadata(&wal_path).unwrap().len();
+    let disk_bytes_after = snapshot_bytes + wal_bytes_after;
     let recovery_median_us = median_recovery_us(&wal_path, operations, live_keys);
 
-    println!("variant=basic");
+    println!("variant=snapshot-compaction");
     println!("operations={operations}");
     println!("live_keys={}", operations.min(live_keys));
-    println!("wal_bytes={wal_bytes}");
+    println!("wal_bytes_before={wal_bytes_before}");
+    println!("wal_bytes_after={wal_bytes_after}");
+    println!("snapshot_bytes={snapshot_bytes}");
+    println!("disk_bytes_after={disk_bytes_after}");
     println!("write_ms={write_ms}");
+    println!("compact_us={compact_us}");
     println!("recovery_median_us={recovery_median_us}");
 }
