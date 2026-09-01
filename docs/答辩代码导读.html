@@ -1,0 +1,1550 @@
+<!doctype html><html lang=zh-CN><head><meta charset=utf-8><meta name=viewport content=width=device-width,initial-scale=1><title>Rust KV 项目答辩代码导读</title><style>:root{color-scheme:light;--ink:#172033;--muted:#58647a;--line:#d8deea;--brand:#2457a7;--soft:#f3f6fb;--code:#111827}*{box-sizing:border-box}body{margin:0;background:#edf1f7;color:var(--ink);font-family:Segoe UI,Microsoft YaHei,PingFang SC,sans-serif;font-size:16px}main{max-width:1180px;margin:32px auto;padding:48px 56px;background:white;border:1px solid var(--line);border-radius:16px;box-shadow:0 12px 36px rgba(23,32,51,.08)}h1{margin-top:0;font-size:2.25rem;color:#12366f}h2{margin-top:2.6rem;padding-bottom:.45rem;border-bottom:2px solid #bfd0ea;color:#173f7a}h3{margin-top:1.8rem;color:#24518f}p,li{line-height:1.75}a{color:var(--brand)}blockquote{margin:1.2rem 0;padding:.8rem 1.1rem;border-left:4px solid #6f96cf;background:var(--soft);color:var(--muted)}pre{overflow:auto;padding:1rem 1.15rem;border-radius:10px;background:var(--code);color:#e5edf8;line-height:1.55}code{font-family:Consolas,Cascadia Code,monospace}p code,li code,td code{padding:.12rem .34rem;border-radius:4px;background:#eef3fa;color:#173f7a}table{display:block;width:100%;overflow-x:auto;border-collapse:collapse;margin:1rem 0 1.5rem}th,td{min-width:120px;padding:.65rem .75rem;border:1px solid var(--line);text-align:left;vertical-align:top;line-height:1.55}th{background:#eaf0f9;color:#173f7a}tr:nth-child(even) td{background:#fafbfd}hr{border:0;border-top:1px solid var(--line);margin:2.2rem 0}strong{color:#142f5c}@media(max-width:760px){main{margin:0;padding:24px 18px;border:0;border-radius:0}body{font-size:15px}h1{font-size:1.8rem}}@media print{body{background:white}main{max-width:none;margin:0;padding:0;border:0;box-shadow:none}pre,table{break-inside:avoid}h2,h3{break-after:avoid}}</style></head><body><main><h1>Rust KV 项目答辩代码导读</h1>
+<blockquote>
+<p>生成日期：2026-09-01<br>源码范围：当前工作区的 <code>Cargo.toml</code>、<code>src/**/*.rs</code>、<code>tests/**/*.rs</code> 与四份 <code>docs/*.md</code>。<br>证据原则：本导读以当前实际源码和当前测试为准；设计文档只用于第 10 节的差异对照。<br>当前复核：<code>cargo fmt --check</code>、<code>cargo clippy --all-targets --all-features -- -D warnings</code>、<code>cargo test</code>、<code>cargo build</code> 均通过；<code>cargo test</code> 为 <strong>41 passed、0 failed、0 ignored</strong>。</p>
+</blockquote>
+<h2>先记住这条主线</h2>
+<pre><code class="language-text">kv-client main
+  → client::run / run_with_io
+  → protocol::parse_command / encode_request_line
+  → TCP
+  → server::serve / handle_connection
+  → protocol::read_frame / parse_request_bytes
+  → server::dispatch
+  → Arc&lt;Mutex&lt;PersistentStore&gt;&gt;
+  → PersistentStore（先写 WAL）
+  → Store（BTreeMap）
+  → Response
+  → TCP
+  → client::display_response
+</code></pre>
+<p>一句话概括：<strong>客户端负责把人类命令变成 JSON Lines；服务器负责连接和分发；<code>PersistentStore</code> 在同一把锁内保证“WAL 成功后才改内存”；<code>Store</code> 用 <code>BTreeMap</code> 保存最终内存状态。</strong></p>
+<hr>
+<h2>1. 项目目录与模块</h2>
+<h3>1.1 核心目录树</h3>
+<pre><code class="language-text">Rust课设/
+├─ Cargo.toml                         # 包、二进制入口、第三方依赖
+├─ Cargo.lock                         # 当前锁定依赖版本
+├─ rust-toolchain.toml                # Rust 1.98.0 Windows MSVC 工具链
+├─ README.md
+├─ src/
+│  ├─ lib.rs                         # 库模块总入口与重导出
+│  ├─ error.rs                       # [公共错误层] 错误码、AppError、Result
+│  ├─ protocol.rs                    # [协议层] 命令、JSON Lines、帧、校验
+│  ├─ storage.rs                     # [存储层] BTreeMap 与内存 CRUD
+│  ├─ persistence.rs                 # [持久化层] PersistentStore、WAL、恢复
+│  ├─ server.rs                      # [网络层] 监听、accept、线程、分发
+│  ├─ client.rs                      # [客户端逻辑] 交互、收发、显示
+│  └─ bin/
+│     ├─ server.rs                   # [服务器入口] kv-server main
+│     └─ client.rs                   # [客户端入口] kv-client main
+├─ tests/
+│  ├─ client.rs                      # [测试] 客户端参数、循环、显示与错误
+│  ├─ network.rs                     # [测试] TCP、帧、并发、重启恢复
+│  ├─ persistence.rs                 # [测试] WAL 创建、恢复与损坏拒绝
+│  └─ protocol_storage.rs            # [测试] 协议、错误码、内存 CRUD
+└─ docs/
+   ├─ 架构设计.md
+   ├─ 协议与持久化设计.md
+   ├─ 需求规格与验收.md
+   └─ 测试环境与演示.md
+</code></pre>
+<p>项目没有单独的 <code>network.rs</code>；<strong>服务端网络层位于 <code>src/server.rs</code></strong>，客户端 TCP 代码位于 <code>src/client.rs</code>，可复用的帧读取位于 <code>src/protocol.rs</code>。</p>
+<h3>1.2 每个 Rust 源文件的职责和调用关系</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>定位与职责</th>
+<th>主要类型 / 函数</th>
+<th>真实调用关系</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>src/bin/server.rs</code></td>
+<td><strong>服务器入口</strong>；解析进程参数、打印帮助、设置退出码</td>
+<td><code>main</code></td>
+<td>调 <code>ServerConfig::parse</code>，成功后调 <code>server::run</code>；错误只在入口打印</td>
+</tr>
+<tr>
+<td><code>src/bin/client.rs</code></td>
+<td><strong>客户端入口</strong>；解析进程参数、打印帮助、设置退出码</td>
+<td><code>main</code></td>
+<td>调 <code>ClientConfig::parse</code>，成功后调 <code>client::run</code></td>
+</tr>
+<tr>
+<td><code>src/lib.rs</code></td>
+<td>库模块总入口</td>
+<td><code>pub mod client/error/persistence/protocol/server/storage</code>；<code>pub use PersistentStore</code></td>
+<td>让两个二进制和集成测试通过 <code>rust_kv_store::*</code> 使用同一套实现</td>
+</tr>
+<tr>
+<td><code>src/error.rs</code></td>
+<td>所有层共享的错误模型</td>
+<td><code>ErrorCode</code>、<code>AppError</code>、<code>Result&lt;T&gt;</code>；<code>code</code>、<code>client_message</code>；<code>From&lt;io::Error&gt;</code>、<code>From&lt;serde_json::Error&gt;</code></td>
+<td>协议、存储、持久化、客户端、服务端都返回该 <code>Result</code>；服务端用 <code>Response::from_error</code> 转为协议错误</td>
+</tr>
+<tr>
+<td><code>src/protocol.rs</code></td>
+<td><strong>协议层</strong>；文本命令、请求/响应模型、JSON Lines、帧限制、字段校验</td>
+<td><code>Frame</code>、<code>Request</code>、<code>ResponseData</code>、<code>ErrorBody</code>、<code>Response</code>；<code>read_frame</code>、<code>parse_command</code>、<code>parse_request_*</code>、<code>parse_response_*</code>、<code>encode_*</code></td>
+<td>客户端用它解析命令和编解码；服务端用它读帧、解码请求、编码响应；持久化恢复复用 <code>read_frame</code></td>
+</tr>
+<tr>
+<td><code>src/storage.rs</code></td>
+<td><strong>内存存储层</strong>；校验键值并维护有序映射</td>
+<td><code>Store</code>、<code>Storage</code> 类型别名、<code>SetOutcome</code>、<code>DeleteOutcome</code>、<code>StoreStatus</code>；<code>set/get/delete/keys/len/status</code>、<code>validate_key/value</code></td>
+<td>被 <code>PersistentStore</code> 包装；协议的 <code>Request::validate</code> 也复用键值校验</td>
+</tr>
+<tr>
+<td><code>src/persistence.rs</code></td>
+<td><strong>持久化层</strong>；把 <code>Store</code> 和唯一 WAL 文件句柄组合成一个原子临界区对象</td>
+<td>私有 <code>WalRecord</code>；<code>PersistentStore</code>；<code>open</code>、<code>set/get/delete/keys/status</code>、<code>append_record</code>、<code>recover_wal</code></td>
+<td>服务启动时由 <code>server::open</code> 创建；写请求先追加 WAL 再调用内层 <code>Store</code>；恢复时逐行重放到新 <code>Store</code></td>
+</tr>
+<tr>
+<td><code>src/server.rs</code></td>
+<td><strong>网络层</strong>；参数、监听、连接线程、请求分发、响应发送</td>
+<td><code>ServerConfig</code>；<code>open</code>、<code>bind</code>、<code>run</code>、<code>serve</code>、<code>handle_connection</code>、<code>dispatch</code>、<code>write_response</code></td>
+<td><code>run</code> 创建 <code>Arc&lt;Mutex&lt;PersistentStore&gt;&gt;</code>；<code>serve</code> accept 后每连接 spawn；<code>dispatch</code> 是网络层进入存储层的唯一入口</td>
+</tr>
+<tr>
+<td><code>src/client.rs</code></td>
+<td><strong>客户端逻辑</strong>；参数、连接、交互循环、请求发送、响应显示</td>
+<td><code>ClientConfig</code>；<code>parse_client_args</code>、<code>run</code>、<code>run_with_io</code>、<code>display_response</code></td>
+<td><code>run</code> 建立 <code>TcpStream</code>；<code>run_with_io</code> 调协议层并通过两个闭包完成收发，测试可替换真实网络</td>
+</tr>
+<tr>
+<td><code>tests/client.rs</code></td>
+<td><strong>客户端测试</strong></td>
+<td>6 个测试；辅助函数 <code>response</code>、<code>error_response</code></td>
+<td>直接调用 <code>parse_client_args</code>、<code>run_with_io</code>，用内存闭包模拟网络</td>
+</tr>
+<tr>
+<td><code>tests/network.rs</code></td>
+<td><strong>网络与并发集成测试</strong></td>
+<td><code>RunningServer</code>、<code>WireClient</code>、15 个测试</td>
+<td>真实绑定回环 TCP；直接调用 <code>server::bind/open/serve</code>；覆盖分段、粘包、并发、重启</td>
+</tr>
+<tr>
+<td><code>tests/persistence.rs</code></td>
+<td><strong>WAL 集成测试</strong></td>
+<td>6 个测试；<code>wal_line</code> 辅助函数</td>
+<td>用临时目录直接调用 <code>PersistentStore::open/set/delete/get</code>，并注入各种损坏字节</td>
+</tr>
+<tr>
+<td><code>tests/protocol_storage.rs</code></td>
+<td><strong>协议与内存存储测试</strong></td>
+<td>13 个测试</td>
+<td>直接调用协议公开入口和 <code>Store</code>，锁定错误码、JSON 形状、限制与 CRUD 语义</td>
+</tr>
+</tbody></table>
+<h3>1.3 模块之间谁调用谁</h3>
+<pre><code class="language-text">bin/client.rs
+  └─ client.rs
+       ├─ protocol.rs
+       ├─ error.rs
+       └─ std::net::TcpStream
+
+bin/server.rs
+  └─ server.rs
+       ├─ protocol.rs
+       ├─ error.rs
+       ├─ persistence.rs
+       │    ├─ storage.rs
+       │    ├─ protocol::read_frame
+       │    └─ error.rs
+       └─ std::net::{TcpListener, TcpStream}
+</code></pre>
+<p><code>protocol.rs</code> 会调用 <code>storage::validate_key/validate_value</code>，因此协议层和存储层共享同一套业务限制；它不直接修改 <code>BTreeMap</code>。</p>
+<hr>
+<h2>2. 核心代码索引</h2>
+<p>以下片段只保留定位实现所需的最小代码。行号对应生成本导读时的当前源码。</p>
+<h3>2.1 入口、监听和线程</h3>
+<table>
+<thead>
+<tr>
+<th>要找的内容</th>
+<th>文件 + 符号</th>
+<th>最小关键代码</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>server main</td>
+<td><code>src/bin/server.rs:1</code>，<code>main</code></td>
+<td><code>server::run(config)</code></td>
+<td>服务器进程入口；参数错误退出码 2，运行错误退出码 1</td>
+</tr>
+<tr>
+<td>client main</td>
+<td><code>src/bin/client.rs:1</code>，<code>main</code></td>
+<td><code>client::run(config)</code></td>
+<td>客户端进程入口；不承载协议或业务逻辑</td>
+</tr>
+<tr>
+<td><code>TcpListener::bind</code></td>
+<td><code>src/server.rs:146</code>，<code>bind</code></td>
+<td><code>let listener = TcpListener::bind(config.bind)?;</code></td>
+<td>绑定配置地址，并设置非阻塞监听</td>
+</tr>
+<tr>
+<td><code>accept</code></td>
+<td><code>src/server.rs:160</code>，<code>serve</code></td>
+<td><code>match listener.accept()</code></td>
+<td>非阻塞轮询新连接；<code>WouldBlock</code> 时休眠 2 ms</td>
+</tr>
+<tr>
+<td>客户端连接处理</td>
+<td><code>src/server.rs:184</code>，<code>handle_connection</code></td>
+<td><code>fn handle_connection(stream: TcpStream, store: Arc&lt;Mutex&lt;PersistentStore&gt;&gt;)</code></td>
+<td>每个连接循环读一帧、解析、分发、回一帧</td>
+</tr>
+<tr>
+<td>创建线程</td>
+<td><code>src/server.rs:172-173</code>，<code>serve</code></td>
+<td><code>let shared_store = Arc::clone(&amp;store);</code> / <code>thread::spawn(move || handle_connection(...));</code></td>
+<td>每个已接受连接一个 OS 线程；<code>Arc</code> 克隆后移入线程</td>
+</tr>
+<tr>
+<td>共享存储创建</td>
+<td><code>src/server.rs:153-156</code>，<code>run</code></td>
+<td><code>Arc::new(Mutex::new(open(&amp;config)?))</code></td>
+<td>唯一 <code>PersistentStore</code> 被所有连接共享和互斥保护</td>
+</tr>
+</tbody></table>
+<h3>2.2 协议、请求和响应</h3>
+<table>
+<thead>
+<tr>
+<th>要找的内容</th>
+<th>文件 + 符号</th>
+<th>最小关键代码</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>请求枚举</td>
+<td><code>src/protocol.rs:82</code>，<code>Request</code></td>
+<td><code>Set { key: String, value: String }</code></td>
+<td>统一表示 7 种合法命令</td>
+</tr>
+<tr>
+<td>客户端文本解析</td>
+<td><code>src/protocol.rs:239</code>，<code>parse_command</code></td>
+<td><code>let tokens = tokenize(input.trim())?;</code></td>
+<td>把 <code>set course rust</code> 变成 <code>Request::Set</code></td>
+</tr>
+<tr>
+<td>服务端请求解析</td>
+<td><code>src/protocol.rs:186</code>，<code>parse_request_bytes</code></td>
+<td><code>from_utf8(line)?; parse_request_line(text)</code></td>
+<td>先判 UTF-8，再进入 JSON 请求解析</td>
+</tr>
+<tr>
+<td>JSON 请求验证</td>
+<td><code>src/protocol.rs:163</code>，<code>parse_request_line</code></td>
+<td><code>decode_json</code> → <code>validate_request_fields</code> → <code>from_value</code> → <code>request.validate()</code></td>
+<td>依次检查帧、JSON、字段集合、类型和业务限制</td>
+</tr>
+<tr>
+<td>JSON 请求编码</td>
+<td><code>src/protocol.rs:220</code>，<code>encode_request_line</code></td>
+<td><code>request.validate()?; encode_json_line(request)</code></td>
+<td>客户端发出前再次验证，并追加 LF</td>
+</tr>
+<tr>
+<td>响应模型</td>
+<td><code>src/protocol.rs:109,129</code>，<code>ResponseData</code> / <code>Response</code></td>
+<td><code>ok</code> + <code>Option&lt;ResponseData&gt;</code> + <code>Option&lt;ErrorBody&gt;</code></td>
+<td>表示成功数据或失败错误，两者严格互斥</td>
+</tr>
+<tr>
+<td>响应生成</td>
+<td><code>src/protocol.rs:138,146,157</code>，<code>Response::{success,error,from_error}</code></td>
+<td><code>Self::error(error.code(), error.client_message())</code></td>
+<td>把业务结果或 <code>AppError</code> 变成稳定协议响应</td>
+</tr>
+<tr>
+<td>TCP 帧读取</td>
+<td><code>src/protocol.rs:29</code>，<code>read_frame&lt;R: BufRead&gt;</code></td>
+<td><code>fill_buf()</code> / <code>consume()</code> / <code>Frame::{Line,TooLarge,Eof,Incomplete}</code></td>
+<td>有界读取到 LF，能处理分段、粘包和超长丢弃</td>
+</tr>
+<tr>
+<td>响应发送</td>
+<td><code>src/server.rs:289</code>，<code>write_response</code></td>
+<td><code>encode_response_line</code> → <code>write_all</code> → <code>flush</code></td>
+<td>编码失败时尝试降级为小型 <code>FRAME_TOO_LARGE</code> 响应</td>
+</tr>
+</tbody></table>
+<h3>2.3 存储和持久化</h3>
+<table>
+<thead>
+<tr>
+<th>要找的内容</th>
+<th>文件 + 符号</th>
+<th>最小关键代码</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>PersistentStore</code> 定义</td>
+<td><code>src/persistence.rs:20</code></td>
+<td><code>store: Store, wal: File, writable: bool</code></td>
+<td>把内存状态、唯一 WAL 句柄和可写状态绑在一起</td>
+</tr>
+<tr>
+<td><code>BTreeMap</code> 定义</td>
+<td><code>src/storage.rs:28-30</code>，<code>Store</code></td>
+<td><code>entries: BTreeMap&lt;String, String&gt;</code></td>
+<td>持有键值，并天然按键字典序迭代</td>
+</tr>
+<tr>
+<td>内存 <code>set</code></td>
+<td><code>src/storage.rs:38</code>，<code>Store::set</code></td>
+<td><code>entries.insert(key.to_owned(), value.to_owned())</code></td>
+<td>新增/覆盖，返回 <code>replaced</code></td>
+</tr>
+<tr>
+<td>内存 <code>get</code></td>
+<td><code>src/storage.rs:49</code>，<code>Store::get</code></td>
+<td><code>entries.get(key).cloned().ok_or_else(...)</code></td>
+<td>返回拥有所有权的值；不存在为 <code>NOT_FOUND</code></td>
+</tr>
+<tr>
+<td>内存 <code>delete</code></td>
+<td><code>src/storage.rs:58</code>，<code>Store::delete</code></td>
+<td><code>entries.remove(key)</code></td>
+<td>删除存在键，否则 <code>NOT_FOUND</code></td>
+</tr>
+<tr>
+<td>内存 <code>keys</code></td>
+<td><code>src/storage.rs:68</code>，<code>Store::keys</code></td>
+<td><code>entries.keys().cloned().collect()</code></td>
+<td>复制有序键快照，返回 <code>Vec&lt;String&gt;</code></td>
+</tr>
+<tr>
+<td>内存 <code>status</code></td>
+<td><code>src/storage.rs:84</code>，<code>Store::status</code></td>
+<td><code>StoreStatus { count: self.len() }</code></td>
+<td>构造统计结构；网络 <code>status</code> 当前实际直接调用 <code>len()</code></td>
+</tr>
+<tr>
+<td>持久化 <code>set</code></td>
+<td><code>src/persistence.rs:58</code>，<code>PersistentStore::set</code></td>
+<td><code>append_record(...)?; self.store.set(key, value)?;</code></td>
+<td><strong>先 WAL，后 BTreeMap</strong></td>
+</tr>
+<tr>
+<td>持久化 <code>get/keys/status</code></td>
+<td><code>src/persistence.rs:72,89,101</code></td>
+<td><code>self.store.get/keys/status(...)</code></td>
+<td>只委托内层 <code>Store</code>，不写 WAL</td>
+</tr>
+<tr>
+<td>持久化 <code>delete</code></td>
+<td><code>src/persistence.rs:77</code>，<code>PersistentStore::delete</code></td>
+<td><code>append_record(...)?; self.store.delete(key)</code></td>
+<td>先确认键存在，再写 delete WAL，再删内存</td>
+</tr>
+<tr>
+<td>WAL 打开</td>
+<td><code>src/persistence.rs:30</code>，<code>PersistentStore::open</code></td>
+<td><code>File::open</code> / <code>OpenOptions::new().append(true).read(true)</code></td>
+<td>创建父目录和缺失文件；恢复成功后才打开追加句柄</td>
+</tr>
+<tr>
+<td>WAL append</td>
+<td><code>src/persistence.rs:115</code>，<code>append_record</code></td>
+<td><code>self.wal.write_all(&amp;encoded)?;</code></td>
+<td>将一条带 LF 的 JSON 记录完整追加</td>
+</tr>
+<tr>
+<td><code>flush</code></td>
+<td><code>src/persistence.rs:129</code>，<code>append_record</code></td>
+<td><code>self.wal.flush()?;</code></td>
+<td>把 Rust 写入层的待处理数据推向操作系统</td>
+</tr>
+<tr>
+<td><code>sync_data</code></td>
+<td><code>src/persistence.rs:130</code>，<code>append_record</code></td>
+<td><code>self.wal.sync_data()?;</code></td>
+<td>请求操作系统同步文件数据后才允许改内存</td>
+</tr>
+<tr>
+<td>WAL 启动恢复</td>
+<td><code>src/persistence.rs:46,146</code>，<code>open</code> / <code>recover_wal</code></td>
+<td><code>let store = recover_wal(File::open(path)?)?;</code></td>
+<td>严格逐行解析并重放；任一损坏即拒绝启动</td>
+</tr>
+</tbody></table>
+<h3>2.4 错误和 <code>Result / ?</code></h3>
+<table>
+<thead>
+<tr>
+<th>要找的内容</th>
+<th>文件 + 符号</th>
+<th>最小关键代码</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>协议错误码</td>
+<td><code>src/error.rs:8</code>，<code>ErrorCode</code></td>
+<td><code>InvalidJson ... NotFound ... StorageError</code></td>
+<td>对客户端稳定输出 <code>SCREAMING_SNAKE_CASE</code> 错误码</td>
+</tr>
+<tr>
+<td>应用错误</td>
+<td><code>src/error.rs:43</code>，<code>AppError</code></td>
+<td><code>Io</code>、<code>Json</code>、<code>InvalidKey</code>、<code>NotFound</code>、<code>Protocol</code>、<code>Persistence</code>、<code>Message</code></td>
+<td>保留内部错误来源，再映射为客户端错误码和消息</td>
+</tr>
+<tr>
+<td>项目 <code>Result</code></td>
+<td><code>src/error.rs:118</code></td>
+<td><code>type Result&lt;T&gt; = std::result::Result&lt;T, AppError&gt;</code></td>
+<td>各模块统一错误返回类型</td>
+</tr>
+<tr>
+<td><code>?</code> 典型位置</td>
+<td><code>src/persistence.rs:35,46</code>，<code>open</code></td>
+<td><code>create_dir_all(parent)?;</code> / <code>recover_wal(File::open(path)?)?;</code></td>
+<td>任一步失败立即提前返回，并通过 <code>From</code> 转成 <code>AppError</code></td>
+</tr>
+<tr>
+<td>显式错误转换</td>
+<td><code>src/server.rs:227-230</code>，<code>dispatch</code></td>
+<td><code>lock().map_err(...).and_then(...)</code></td>
+<td>把 Mutex 中毒变成 <code>STORAGE_ERROR</code>，再统一生成响应</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>3. 真实请求调用链</h2>
+<h3>3.1 <code>set course rust</code> 的完整实际链路</h3>
+<p>客户端连接是在进入交互循环前建立的：<code>src/client.rs:131</code> 的 <code>TcpStream::connect</code> 对应服务端 <code>src/server.rs:167</code> 的 <code>accept</code>；服务端随后在 <code>src/server.rs:173</code> 为该连接创建线程。以下从用户输入开始追踪。</p>
+<table>
+<thead>
+<tr>
+<th align="right">步骤</th>
+<th>文件 / 函数</th>
+<th>输入</th>
+<th>输出</th>
+</tr>
+</thead>
+<tbody><tr>
+<td align="right">1</td>
+<td><code>src/client.rs:166</code>，<code>run_with_io</code></td>
+<td>标准输入的一行 <code>set course rust\n</code></td>
+<td><code>String line</code> 拥有该行文本</td>
+</tr>
+<tr>
+<td align="right">2</td>
+<td><code>src/client.rs:189</code> → <code>src/protocol.rs:239</code>，<code>parse_command(&amp;line)</code></td>
+<td>借用 <code>&amp;str</code></td>
+<td>调 <code>tokenize</code>，得到 <code>Vec&lt;String&gt;</code>：<code>[&quot;set&quot;, &quot;course&quot;, &quot;rust&quot;]</code></td>
+</tr>
+<tr>
+<td align="right">3</td>
+<td><code>src/protocol.rs:545</code>，<code>tokenize</code></td>
+<td><code>set course rust</code> 的字节视图</td>
+<td>三个拥有所有权的 token；普通参数按 ASCII 空白分隔，带引号参数按 JSON 字符串解析</td>
+</tr>
+<tr>
+<td align="right">4</td>
+<td><code>src/protocol.rs:248-285</code>，<code>parse_command</code></td>
+<td>token 向量</td>
+<td><code>Request::Set { key: &quot;course&quot;.to_owned(), value: &quot;rust&quot;.to_owned() }</code>；随后 <code>Request::validate</code> 检查键值</td>
+</tr>
+<tr>
+<td align="right">5</td>
+<td><code>src/client.rs:198-200</code> → <code>src/protocol.rs:220</code>，<code>encode_request_line</code></td>
+<td><code>&amp;Request</code></td>
+<td><code>Vec&lt;u8&gt;</code>，内容为 <code>{&quot;cmd&quot;:&quot;set&quot;,&quot;key&quot;:&quot;course&quot;,&quot;value&quot;:&quot;rust&quot;}\n</code></td>
+</tr>
+<tr>
+<td align="right">6</td>
+<td><code>src/client.rs:140-143,208</code>，发送闭包</td>
+<td><code>&amp;encoded</code>，即 <code>&amp;[u8]</code></td>
+<td><code>TcpStream::write_all</code> 后 <code>flush</code>；字节进入 TCP 字节流</td>
+</tr>
+<tr>
+<td align="right">7</td>
+<td><code>src/server.rs:193</code> → <code>src/protocol.rs:29</code>，<code>read_frame</code></td>
+<td><code>BufReader&lt;TcpStream&gt;</code> 中可能分多次到达的字节</td>
+<td><code>Frame::Line(Vec&lt;u8&gt;)</code>，包含结尾 LF；粘在后面的下一帧仍留在缓冲区</td>
+</tr>
+<tr>
+<td align="right">8</td>
+<td><code>src/server.rs:207</code> → <code>src/protocol.rs:186</code>，<code>parse_request_bytes</code></td>
+<td>一帧原始字节</td>
+<td>UTF-8 合法时得到 <code>&amp;str</code>；非法时得到 <code>AppError::Protocol(INVALID_UTF8)</code></td>
+</tr>
+<tr>
+<td align="right">9</td>
+<td><code>src/protocol.rs:163</code>，<code>parse_request_line</code></td>
+<td>完整 JSON Lines 文本</td>
+<td>去 LF/可选 CR、检查 64 KiB、JSON 解码为 <code>Value</code>、检查字段、反序列化并再次业务校验，最终输出 <code>Request::Set</code></td>
+</tr>
+<tr>
+<td align="right">10</td>
+<td><code>src/server.rs:208,222</code>，<code>dispatch</code></td>
+<td><code>Request::Set</code> 被按值移动进入分发</td>
+<td>match 解构出拥有所有权的 <code>String key/value</code></td>
+</tr>
+<tr>
+<td align="right">11</td>
+<td><code>src/server.rs:227-230</code>，<code>dispatch</code> 的 Set 分支</td>
+<td><code>&amp;Arc&lt;Mutex&lt;PersistentStore&gt;&gt;</code></td>
+<td><code>lock()</code> 得到可变 <code>MutexGuard</code>；调用 <code>PersistentStore::set(&amp;key, &amp;value)</code></td>
+</tr>
+<tr>
+<td align="right">12</td>
+<td><code>src/persistence.rs:58</code>，<code>PersistentStore::set</code></td>
+<td>借用的 <code>&quot;course&quot;</code>、<code>&quot;rust&quot;</code></td>
+<td>检查 <code>writable</code>、键值合法性，并读取当前是否存在，得到 <code>replaced</code></td>
+</tr>
+<tr>
+<td align="right">13</td>
+<td><code>src/persistence.rs:63-66</code>，构造 <code>WalRecord::Set</code></td>
+<td>借用的键和值</td>
+<td>新建拥有自身 <code>String</code> 的临时 WAL 记录</td>
+</tr>
+<tr>
+<td align="right">14</td>
+<td><code>src/persistence.rs:115</code>，<code>append_record</code></td>
+<td><code>&amp;WalRecord::Set</code></td>
+<td>JSON 编码后追加 LF，形成 <code>{&quot;op&quot;:&quot;set&quot;,&quot;key&quot;:&quot;course&quot;,&quot;value&quot;:&quot;rust&quot;}\n</code></td>
+</tr>
+<tr>
+<td align="right">15</td>
+<td><code>src/persistence.rs:128-130</code>，<code>append_record</code></td>
+<td>WAL 字节</td>
+<td>顺序执行 <code>write_all</code> → <code>flush</code> → <code>sync_data</code>；全部成功才返回 <code>Ok(())</code></td>
+</tr>
+<tr>
+<td align="right">16</td>
+<td><code>src/persistence.rs:67</code> → <code>src/storage.rs:38</code>，<code>Store::set</code></td>
+<td>同一锁内借用的键和值</td>
+<td><code>BTreeMap::insert</code> 获取自己的字符串副本；首次插入输出 <code>SetOutcome { replaced: false }</code></td>
+</tr>
+<tr>
+<td align="right">17</td>
+<td><code>src/server.rs:231-239</code>，<code>dispatch</code></td>
+<td><code>SetOutcome</code></td>
+<td>MutexGuard 在闭包返回时释放；随后构造 <code>Response::success(ResponseData::Set { replaced: false })</code></td>
+</tr>
+<tr>
+<td align="right">18</td>
+<td><code>src/server.rs:289</code>，<code>write_response</code></td>
+<td><code>&amp;Response</code></td>
+<td><code>{&quot;ok&quot;:true,&quot;data&quot;:{&quot;kind&quot;:&quot;set&quot;,&quot;replaced&quot;:false}}\n</code>，经 <code>write_all</code> 和 <code>flush</code> 回到 TCP</td>
+</tr>
+<tr>
+<td align="right">19</td>
+<td><code>src/client.rs:145,213-237</code>，接收与解析</td>
+<td>服务端响应字节</td>
+<td><code>read_frame</code> → UTF-8 → <code>parse_response_line</code> → <code>Response</code></td>
+</tr>
+<tr>
+<td align="right">20</td>
+<td><code>src/client.rs:239,250-282</code>，<code>display_response</code></td>
+<td><code>&amp;Response</code></td>
+<td>首次写入显示 <code>created</code>；若原键已存在则显示 <code>replaced</code>，然后打印下一次提示符</td>
+</tr>
+</tbody></table>
+<p>关键状态变化只有这一段，并且全在同一把 Mutex 锁内：</p>
+<pre><code class="language-text">WAL write_all → flush → sync_data → BTreeMap::insert
+</code></pre>
+<p>只要前三步任一步报错，<code>?</code> 就会阻止 <code>BTreeMap::insert</code> 执行，服务端返回 <code>STORAGE_ERROR</code> 而不是成功。</p>
+<h3>3.2 <code>get course</code> 简要实际链路</h3>
+<pre><code class="language-text">&quot;get course\n&quot;
+→ parse_command
+→ Request::Get { key: &quot;course&quot; }
+→ {&quot;cmd&quot;:&quot;get&quot;,&quot;key&quot;:&quot;course&quot;}\n
+→ TCP / read_frame / parse_request_bytes
+→ dispatch(Request::Get)
+→ Mutex::lock
+→ PersistentStore::get
+→ Store::get
+→ BTreeMap::get(&quot;course&quot;).cloned()
+→ 释放 MutexGuard
+→ ResponseData::Get { value: &quot;rust&quot; }
+→ {&quot;ok&quot;:true,&quot;data&quot;:{&quot;kind&quot;:&quot;get&quot;,&quot;value&quot;:&quot;rust&quot;}}\n
+→ 客户端显示：value: rust
+</code></pre>
+<p><code>get</code> <strong>不写 WAL</strong>。<code>Store::get</code> 在锁内把 <code>String</code> 克隆出来；因此锁释放后，响应仍拥有独立的值，可以安全编码和发送。</p>
+<h3>3.3 <code>delete course</code> 简要实际链路</h3>
+<pre><code class="language-text">&quot;delete course\n&quot;
+→ parse_command
+→ Request::Delete { key: &quot;course&quot; }
+→ {&quot;cmd&quot;:&quot;delete&quot;,&quot;key&quot;:&quot;course&quot;}\n
+→ TCP / read_frame / parse_request_bytes
+→ dispatch(Request::Delete)
+→ Mutex::lock
+→ PersistentStore::delete
+   → ensure_writable
+   → validate_key
+   → contains_key（不存在则立即 NOT_FOUND，且不写 WAL）
+   → append {&quot;op&quot;:&quot;delete&quot;,&quot;key&quot;:&quot;course&quot;}\n
+   → flush
+   → sync_data
+   → Store::delete / BTreeMap::remove
+→ 释放 MutexGuard
+→ ResponseData::Delete { deleted: true }
+→ 客户端显示：deleted: true
+</code></pre>
+<p>删除后再次 <code>get course</code> 或 <code>delete course</code>，最终由 <code>Store</code> / <code>PersistentStore</code> 返回 <code>AppError::NotFound</code>，服务端编码成 <code>NOT_FOUND</code>。</p>
+<hr>
+<h2>4. Rust 类型地图</h2>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>实际出现位置</th>
+<th>为什么需要 / 在本项目中解决什么问题</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>String</code></td>
+<td><code>Request</code>、<code>WalRecord</code>、<code>BTreeMap&lt;String, String&gt;</code>、配置与错误消息</td>
+<td>让请求、存储、WAL 和响应拥有文本数据，不依赖输入缓冲区寿命</td>
+</tr>
+<tr>
+<td><code>&amp;str</code></td>
+<td><code>Store::set/get/delete</code>、<code>validate_key/value</code>、<code>parse_command</code></td>
+<td>只读借用调用者文本，避免只为校验或查询额外复制</td>
+</tr>
+<tr>
+<td><code>&amp;[u8]</code></td>
+<td><code>parse_request_bytes</code>、客户端发送闭包 <code>FnMut(&amp;[u8])</code></td>
+<td>网络数据在确认 UTF-8 前只是字节，不能提前当作字符串</td>
+</tr>
+<tr>
+<td><code>&amp;T</code></td>
+<td><code>encode_request_line(&amp;Request)</code>、<code>Response::from_error(&amp;AppError)</code>、<code>dispatch(..., &amp;Arc&lt;...&gt;)</code></td>
+<td>只读共享，函数不取得对象所有权</td>
+</tr>
+<tr>
+<td><code>&amp;mut T</code></td>
+<td><code>read_frame(&amp;mut R)</code>、<code>Store::set(&amp;mut self)</code>、<code>write_response(&amp;mut TcpStream)</code></td>
+<td>修改读取位置、映射内容或流写入状态；编译器保证同一时刻没有冲突借用</td>
+</tr>
+<tr>
+<td><code>Option&lt;T&gt;</code></td>
+<td><code>Response.data/error</code>、配置解析 <code>Option&lt;ClientConfig&gt;</code>、<code>BTreeMap::insert/remove</code> 的返回值</td>
+<td>表示“可能没有”：成功/错误载荷二选一、帮助模式无配置、旧值或删除目标可能不存在</td>
+</tr>
+<tr>
+<td><code>Result&lt;T, E&gt;</code></td>
+<td>全项目；别名 <code>error::Result&lt;T&gt;</code> 与局部 <code>io::Result&lt;T&gt;</code></td>
+<td>显式传播可恢复错误；<code>?</code> 让失败立即返回而不 panic</td>
+</tr>
+<tr>
+<td><code>Vec&lt;u8&gt;</code></td>
+<td><code>Frame::Line</code>、JSON 编码结果、客户端响应字节</td>
+<td>拥有一整帧网络/WAL 字节，允许非 UTF-8 输入先被安全处理</td>
+</tr>
+<tr>
+<td><code>Vec&lt;String&gt;</code></td>
+<td>token、<code>keys</code> 响应</td>
+<td>拥有命令参数或键快照；锁释放后仍可使用</td>
+</tr>
+<tr>
+<td><code>BTreeMap&lt;String, String&gt;</code></td>
+<td><code>src/storage.rs:29</code></td>
+<td>保存内存键值；迭代键时天然按字典序，直接满足 <code>keys</code> 语义</td>
+</tr>
+<tr>
+<td><code>Arc&lt;T&gt;</code></td>
+<td><code>Arc&lt;Mutex&lt;PersistentStore&gt;&gt;</code>、<code>Arc&lt;AtomicBool&gt;</code></td>
+<td>多个连接线程共享同一对象；引用计数保证最后一个使用者结束前对象不析构</td>
+</tr>
+<tr>
+<td><code>Mutex&lt;T&gt;</code></td>
+<td><code>Mutex&lt;PersistentStore&gt;</code></td>
+<td>保证同一时刻只有一个线程读写共享 Store/WAL；尤其防止多条 WAL 写入交错</td>
+</tr>
+<tr>
+<td><code>MutexGuard&lt;&#39;_, T&gt;</code></td>
+<td><code>store.lock()</code> 的推导返回类型</td>
+<td>RAII 锁守卫；离开闭包/作用域自动解锁，源码没有手写 <code>unlock</code></td>
+</tr>
+<tr>
+<td><code>AtomicBool</code> / <code>Ordering</code></td>
+<td><code>server::serve</code> 的 <code>stop</code></td>
+<td>测试可跨线程通知 accept 循环停止；生产 <code>run</code> 传入恒为 false 的标志并依赖进程中断</td>
+</tr>
+<tr>
+<td><code>TcpListener</code></td>
+<td><code>server::bind/serve</code></td>
+<td>在指定地址监听并 <code>accept</code> 多个 TCP 连接</td>
+</tr>
+<tr>
+<td><code>TcpStream</code></td>
+<td><code>client::run</code>、<code>server::handle_connection</code></td>
+<td>双向 TCP 字节流；两端都用 <code>try_clone</code> 分成读写句柄</td>
+</tr>
+<tr>
+<td><code>BufReader&lt;TcpStream&gt;</code></td>
+<td>客户端、服务端</td>
+<td>为 <code>BufRead::fill_buf/consume</code> 提供缓冲，支持一帧被拆分或多帧粘在一次接收中</td>
+</tr>
+<tr>
+<td><code>BufReader&lt;File&gt;</code></td>
+<td><code>recover_wal</code></td>
+<td>逐帧读取 WAL，同时复用相同的有界 <code>read_frame</code></td>
+</tr>
+<tr>
+<td><code>File</code> / <code>OpenOptions</code></td>
+<td><code>PersistentStore</code></td>
+<td><code>File</code> 持有 WAL 句柄；<code>OpenOptions</code> 以 append+read 方式重新打开恢复后的 WAL</td>
+</tr>
+<tr>
+<td><code>Path</code> / <code>PathBuf</code></td>
+<td><code>PersistentStore::open</code>、<code>ServerConfig.data</code></td>
+<td><code>PathBuf</code> 拥有配置路径；<code>AsRef&lt;Path&gt;</code> 让 <code>open</code> 接受多种路径参数而不强制复制</td>
+</tr>
+<tr>
+<td><code>SocketAddr</code></td>
+<td><code>ServerConfig.bind</code>、网络测试</td>
+<td>结构化保存 IP 和端口，并允许 <code>TcpListener::bind</code> 直接使用</td>
+</tr>
+<tr>
+<td>自定义 <code>struct</code></td>
+<td><code>Store</code>、<code>PersistentStore</code>、<code>Response</code>、<code>ErrorBody</code>、<code>StoreStatus</code>、<code>SetOutcome</code>、<code>DeleteOutcome</code>、<code>ClientConfig</code>、<code>ServerConfig</code></td>
+<td>把相关状态和不变量组合起来；例如 <code>PersistentStore</code> 把内存与 WAL 生命周期绑定</td>
+</tr>
+<tr>
+<td>自定义 <code>enum</code></td>
+<td><code>Request</code>、<code>ResponseData</code>、<code>Frame</code>、<code>ErrorCode</code>、<code>AppError</code>、私有 <code>WalRecord</code></td>
+<td>用穷举分支表达有限状态，match 必须覆盖所有命令、帧和错误种类</td>
+</tr>
+<tr>
+<td>trait 实现</td>
+<td><code>Default</code>、<code>Display</code>、<code>Error</code>、<code>From</code>、Serde 的 <code>Serialize/Deserialize</code></td>
+<td>提供默认配置、格式化、错误转换和 JSON 编解码；项目<strong>没有自定义 trait</strong></td>
+</tr>
+<tr>
+<td>泛型 / trait bound</td>
+<td><code>read_frame&lt;R: BufRead&gt;</code>、<code>encode_json_line&lt;T: Serialize&gt;</code>、<code>open(path: impl AsRef&lt;Path&gt;)</code>、<code>run_with_io&lt;R,W,Send,Receive&gt;</code></td>
+<td>同一逻辑可用于 TCP、文件、内存 Cursor 和测试闭包，避免复制多套实现</td>
+</tr>
+<tr>
+<td><code>FnMut</code> 闭包</td>
+<td><code>run_with_io</code> 的 <code>Send</code> / <code>Receive</code></td>
+<td>生产环境闭包操作 TCP；测试闭包记录请求、按队列返回响应，实现无网络客户端测试</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>5. 所有权与并发热点</h2>
+<h3>热点 1：文本输入先拥有，再借用解析</h3>
+<p><code>src/client.rs:181-190</code></p>
+<pre><code class="language-rust">let mut line = String::new();
+input.read_line(&amp;mut line)?;
+let request = parse_command(&amp;line)?;
+</code></pre>
+<p><code>line</code> 拥有输入字符；<code>read_line</code> 通过 <code>&amp;mut String</code> 修改它，<code>parse_command</code> 只借用 <code>&amp;line</code>。解析结束后借用终止，下一轮可以 <code>line.clear()</code> 并复用分配的容量。</p>
+<h3>热点 2：token 的 <code>String</code> clone 是真实数据复制</h3>
+<p><code>src/protocol.rs:248-252</code></p>
+<pre><code class="language-rust">Request::Set {
+    key: tokens[1].clone(),
+    value: tokens[2].clone(),
+}
+</code></pre>
+<p>这里 clone 的是两个 <code>String</code> 的堆数据，不是指针引用计数。原因是通过索引只能借用 <code>Vec</code> 元素，而返回的 <code>Request</code> 必须独立拥有键和值。</p>
+<h3>热点 3：请求按值进入 <code>dispatch</code>，match 移动字段</h3>
+<p><code>src/server.rs:222-230</code></p>
+<pre><code class="language-rust">fn dispatch(request: Request, store: &amp;Arc&lt;Mutex&lt;PersistentStore&gt;&gt;) -&gt; (Response, bool) {
+    match request {
+        Request::Set { key, value } =&gt; { /* ... */ }
+</code></pre>
+<p><code>request</code> 的所有权从连接处理函数移动到 <code>dispatch</code>；match 再把 <code>key</code>、<code>value</code> 两个 <code>String</code> 移出枚举。调用 <code>store.set(&amp;key, &amp;value)</code> 时只是临时借用，分支结束后这两个局部值被释放。</p>
+<h3>热点 4：<code>Arc::clone</code> 只克隆共享指针，不复制 Store/WAL</h3>
+<p><code>src/server.rs:167-173</code></p>
+<pre><code class="language-rust">let shared_store = Arc::clone(&amp;store);
+thread::spawn(move || handle_connection(stream, shared_store));
+</code></pre>
+<p><code>Arc::clone</code> 增加引用计数，所有线程仍指向同一个 <code>Mutex&lt;PersistentStore&gt;</code>；不会复制 <code>BTreeMap</code>，也不会打开第二个 WAL。<code>move</code> 把 <code>stream</code> 和这一个 Arc 句柄的所有权转移给新线程，使线程闭包满足所需生命周期。</p>
+<h3>热点 5：一条 TCP 连接拆成读句柄和写句柄</h3>
+<p><code>src/server.rs:184-190</code>；客户端对应 <code>src/client.rs:131-135</code></p>
+<pre><code class="language-rust">let writer = match stream.try_clone() {
+    Ok(writer) =&gt; writer,
+    Err(_) =&gt; return,
+};
+let mut reader = BufReader::new(stream);
+</code></pre>
+<p>原 <code>TcpStream</code> 被移动进 <code>BufReader</code>；<code>try_clone</code> 复制的是指向同一底层 socket 的系统句柄，不是复制网络数据。这样读侧可保持缓冲状态，写侧可独立调用 <code>write_all/flush</code>。</p>
+<h3>热点 6：锁在 <code>dispatch</code> 中获得，并在结果产生后立即释放</h3>
+<p><code>src/server.rs:226-239</code></p>
+<pre><code class="language-rust">let result = store
+    .lock()
+    .map_err(|_| AppError::Message(&quot;storage mutex poisoned&quot;.to_owned()))
+    .and_then(|mut store| store.set(&amp;key, &amp;value));
+</code></pre>
+<p><code>lock()</code> 成功后产生 <code>MutexGuard&lt;PersistentStore&gt;</code>；闭包参数 <code>mut store</code> 允许通过 DerefMut 调用 <code>&amp;mut self</code> 的 <code>set</code>。守卫在 <code>and_then</code> 闭包返回时 drop，因此后面的 <code>Response::success</code> 构造和 <code>write_response</code> 都不持锁。</p>
+<p>写请求的锁范围包含：</p>
+<pre><code class="language-text">contains_key → WAL encode/write/flush/sync_data → BTreeMap 修改
+</code></pre>
+<p>这保证 WAL 顺序和内存修改顺序一致。</p>
+<h3>热点 7：<code>get</code> 和 <code>keys</code> clone 数据快照后释放锁</h3>
+<p><code>src/storage.rs:49-54,68-69</code></p>
+<pre><code class="language-rust">self.entries.get(key).cloned()
+self.entries.keys().cloned().collect()
+</code></pre>
+<p>这里 clone 的是值字符串或所有键字符串，属于数据复制。代价换来清晰的并发边界：响应不借用 <code>BTreeMap</code> 内部数据，所以锁释放后仍能序列化并发送。</p>
+<h3>热点 8：<code>Store::set</code> 通过 <code>&amp;mut self</code> 独占修改，并让映射拥有数据</h3>
+<p><code>src/storage.rs:38-45</code></p>
+<pre><code class="language-rust">self.entries.insert(key.to_owned(), value.to_owned())
+</code></pre>
+<p><code>&amp;mut self</code> 保证调用期间没有其他借用者修改同一 <code>Store</code>；<code>to_owned</code> 将借用的 <code>&amp;str</code> 复制为映射拥有的 <code>String</code>。即使请求局部变量随后析构，BTreeMap 中的数据仍有效。</p>
+<h3>热点 9：WAL 临时记录拥有 String，但 append 只借用记录</h3>
+<p><code>src/persistence.rs:63-67,115-117</code></p>
+<pre><code class="language-rust">self.append_record(&amp;WalRecord::Set {
+    key: key.to_owned(),
+    value: value.to_owned(),
+})?;
+</code></pre>
+<p>临时 <code>WalRecord</code> 需要自己的字符串以满足 Serde 序列化；<code>append_record</code> 接收 <code>&amp;WalRecord</code>，不夺走它。序列化产生新的 <code>Vec&lt;u8&gt;</code>；写完后临时记录与字节缓冲自动释放。</p>
+<h3>5.1 为什么网络 read/write 时不持锁</h3>
+<p>真实顺序是：</p>
+<pre><code class="language-text">read_frame（无锁）
+→ UTF-8/JSON/字段校验（无锁）
+→ dispatch 中 lock
+→ 只做必要存储操作
+→ MutexGuard drop
+→ Response JSON 编码（无锁）
+→ TcpStream::write_all/flush（无锁）
+</code></pre>
+<p>网络等待时间不可预测。如果读网络时持锁，一个空闲客户端会阻止全部客户端访问；如果写网络时持锁，一个接收很慢的客户端会拖住所有存储操作。当前 <code>idle_client_does_not_hold_storage_lock</code> 测试专门验证空闲连接不会占住存储锁。</p>
+<h3>5.2 本项目中的几种 clone 不要混淆</h3>
+<table>
+<thead>
+<tr>
+<th>写法</th>
+<th>clone 的对象</th>
+<th>是否复制 KV 数据</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Arc::clone(&amp;store)</code></td>
+<td>Arc 句柄和引用计数</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>tokens[i].clone()</code></td>
+<td>一个 <code>String</code> 的字符数据</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>BTreeMap::get(...).cloned()</code></td>
+<td>value <code>String</code></td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>entries.keys().cloned()</code></td>
+<td>每个 key <code>String</code></td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>TcpStream::try_clone()</code></td>
+<td>同一 socket 的系统句柄</td>
+<td>否，不复制已传输字节</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>6. 持久化真实实现</h2>
+<h3>6.1 <code>set</code> 的实际顺序</h3>
+<p>入口为 <code>src/persistence.rs:58</code> 的 <code>PersistentStore::set</code>：</p>
+<pre><code class="language-text">ensure_writable
+→ validate_key / validate_value
+→ contains_key，保存 replaced
+→ 构造 WalRecord::Set（复制 key/value）
+→ append_record
+   → serde_json::to_vec
+   → push LF
+   → File::write_all
+   → File::flush
+   → File::sync_data
+→ Store::set
+→ BTreeMap::insert
+→ SetOutcome { replaced }
+</code></pre>
+<p><code>PersistentStore</code> 和 WAL 句柄都在 Mutex 内，所以两个客户端不可能同时写同一个文件句柄。<code>Store::set</code> 会再次校验键值；当前实现中前面已经用同一组函数验证过，因此 WAL 成功后这次校验没有新的正常失败条件。</p>
+<h3>6.2 <code>delete</code> 的实际顺序</h3>
+<p>入口为 <code>src/persistence.rs:77</code>：</p>
+<pre><code class="language-text">ensure_writable
+→ validate_key
+→ contains_key
+   ├─ false：返回 NOT_FOUND，不写 WAL
+   └─ true：继续
+→ 构造 WalRecord::Delete
+→ append_record：write_all → flush → sync_data
+→ Store::delete
+→ BTreeMap::remove
+</code></pre>
+<p>提前检查存在性很重要：否则删除不存在的键也会进入 WAL，而恢复时 <code>Store::delete</code> 会把这种记录判为损坏。</p>
+<h3>6.3 写入错误路径</h3>
+<p><code>append_record</code> 把三个 I/O 操作放在一个返回 <code>io::Result&lt;()&gt;</code> 的闭包中。任意一步失败时：</p>
+<ol>
+<li>立即跳过内层 <code>Store::set/delete</code>，所以本次内存状态不更新；</li>
+<li><code>self.writable = false</code>，把该 <code>PersistentStore</code> 标记为永久不可写；</li>
+<li>返回 <code>AppError::Persistence(&quot;WAL write failed: ...&quot;)</code>；</li>
+<li>服务端经 <code>ErrorCode::StorageError</code> 返回 <code>STORAGE_ERROR</code>；</li>
+<li>后续 <code>set/delete</code> 被 <code>ensure_writable</code> 拒绝，但 <code>get/keys/status</code> 仍可读。</li>
+</ol>
+<p>永久拒绝后续写，是因为 <code>write_all/flush/sync_data</code> 失败时无法安全断定文件末尾是否已经部分变化；继续追加可能掩盖或扩大损坏。<code>src/persistence.rs</code> 内置测试 <code>injected_write_failure_preserves_memory_and_poison_writes</code> 锁定了这条行为。</p>
+<h3>6.4 启动恢复的实际顺序</h3>
+<p><code>PersistentStore::open</code> 与 <code>recover_wal</code> 的链路：</p>
+<pre><code class="language-text">取得 Path
+→ 如有父目录则 create_dir_all
+→ File::open
+   ├─ 已存在：只确认可打开
+   ├─ NotFound：create_new 创建空文件
+   └─ 其他错误：返回
+→ 再次 File::open，交给 recover_wal
+→ Store::new
+→ BufReader&lt;File&gt;
+→ 循环 read_frame
+   ├─ Eof：恢复完成
+   ├─ Incomplete：报“该行没有 LF”
+   ├─ TooLarge：报该行超过 65536 字节
+   └─ Line：去 LF/可选 CR，拒绝空行
+→ serde_json::from_slice::&lt;WalRecord&gt;
+→ match WalRecord
+   ├─ Set：Store::set
+   └─ Delete：validate_key + Store::delete
+→ 任一错误包装为带 1-based 行号的 AppError::Persistence
+→ 恢复成功后用 append(true).read(true) 打开唯一 WAL 句柄
+</code></pre>
+<p><code>WalRecord</code> 使用 <code>#[serde(tag = &quot;op&quot;, rename_all = &quot;lowercase&quot;, deny_unknown_fields)]</code>，所以只接受 <code>set/delete</code>、固定字段和固定类型。恢复不会跳过坏行、不会截断尾部、不会覆盖原文件；错误直接阻止服务器进入监听状态。</p>
+<h3>6.5 当前实现没有做的事情</h3>
+<ul>
+<li>没有快照、WAL 压缩或定期重写；文件只追加。</li>
+<li>没有容忍“最后一条半写记录”；缺 LF 直接判损坏。</li>
+<li>没有文件级跨进程锁；并发安全来自单进程中的 <code>Mutex</code>。</li>
+<li>没有后台异步刷盘；写请求在线程内同步等待 <code>sync_data</code>。</li>
+<li>没有事务批次；每个 <code>set/delete</code> 各是一条 WAL 记录。</li>
+</ul>
+<hr>
+<h2>7. Cargo 依赖</h2>
+<h3>7.1 包配置</h3>
+<p><code>Cargo.toml</code> 声明：</p>
+<ul>
+<li>包名：<code>rust-kv-store</code>，版本 <code>0.1.0</code>；</li>
+<li>Rust edition：2024；</li>
+<li>最低 Rust 版本：1.98；</li>
+<li>两个二进制：<code>kv-server</code>、<code>kv-client</code>。</li>
+</ul>
+<h3>7.2 第三方 crate</h3>
+<table>
+<thead>
+<tr>
+<th>dependency</th>
+<th><code>Cargo.toml</code> 声明</th>
+<th>当前 <code>Cargo.lock</code></th>
+<th>使用代码</th>
+<th>解决的问题</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>serde</code></td>
+<td><code>1</code>，features=<code>derive</code></td>
+<td><code>1.0.229</code></td>
+<td><code>error.rs</code> 的 <code>ErrorCode</code>；<code>protocol.rs</code> 的请求/响应；<code>persistence.rs</code> 的 <code>WalRecord</code>；<code>storage.rs</code> 的 <code>StoreStatus</code></td>
+<td>通过派生实现结构体/枚举的序列化和反序列化</td>
+</tr>
+<tr>
+<td><code>serde_json</code></td>
+<td><code>1</code></td>
+<td><code>1.0.151</code></td>
+<td><code>protocol.rs:173-235,314-316</code>；<code>persistence.rs:116,176</code>；<code>error.rs</code> 的 JSON 错误转换</td>
+<td>把请求、响应、WAL 在 Rust 类型与 JSON 字节之间转换；也用于严格字段预检查</td>
+</tr>
+<tr>
+<td><code>tempfile</code></td>
+<td><code>3</code>，仅 <code>[dev-dependencies]</code></td>
+<td><code>3.27.0</code></td>
+<td><code>tests/network.rs</code>、<code>tests/persistence.rs</code>、<code>persistence.rs</code> 内置测试</td>
+<td>每个测试创建独立临时目录/WAL，防止相互污染；生产二进制不依赖它</td>
+</tr>
+</tbody></table>
+<p>版本号 <code>1</code> / <code>3</code> 是 Cargo 的兼容版本范围，右侧是当前锁文件实际解析结果。</p>
+<h3>7.3 Rust 标准库，不是 Cargo dependency</h3>
+<table>
+<thead>
+<tr>
+<th>标准库模块</th>
+<th>主要位置</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>std::collections::BTreeMap</code></td>
+<td><code>storage.rs</code></td>
+<td>有序 KV 内存结构</td>
+</tr>
+<tr>
+<td><code>std::net::{TcpListener,TcpStream,SocketAddr}</code></td>
+<td><code>server.rs</code>、<code>client.rs</code></td>
+<td>TCP 监听、连接和地址</td>
+</tr>
+<tr>
+<td><code>std::sync::{Arc,Mutex}</code></td>
+<td><code>server.rs</code></td>
+<td>多线程共享和互斥</td>
+</tr>
+<tr>
+<td><code>std::sync::atomic::{AtomicBool,Ordering}</code></td>
+<td><code>server.rs</code></td>
+<td>可测试的监听停止标志</td>
+</tr>
+<tr>
+<td><code>std::thread</code> / <code>Duration</code></td>
+<td><code>server.rs</code></td>
+<td>每连接线程；非阻塞 accept 的 2 ms 退避</td>
+</tr>
+<tr>
+<td><code>std::io::{BufRead,BufReader,Write}</code></td>
+<td>协议、客户端、服务端、持久化</td>
+<td>帧缓冲、网络与文件写入</td>
+</tr>
+<tr>
+<td><code>std::fs::{File,OpenOptions}</code></td>
+<td><code>persistence.rs</code></td>
+<td>WAL 打开、创建、追加、同步</td>
+</tr>
+<tr>
+<td><code>std::path::{Path,PathBuf}</code></td>
+<td><code>persistence.rs</code>、<code>server.rs</code></td>
+<td>数据文件路径</td>
+</tr>
+<tr>
+<td><code>std::fmt</code> / <code>std::error::Error</code></td>
+<td><code>error.rs</code></td>
+<td>错误显示和标准错误 trait</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>8. 测试到实现的映射</h2>
+<h3>8.1 当前真实测试数量</h3>
+<table>
+<thead>
+<tr>
+<th>测试目标</th>
+<th align="right">数量</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>src/persistence.rs</code> 内置单元测试</td>
+<td align="right">1</td>
+</tr>
+<tr>
+<td><code>tests/client.rs</code></td>
+<td align="right">6</td>
+</tr>
+<tr>
+<td><code>tests/network.rs</code></td>
+<td align="right">15</td>
+</tr>
+<tr>
+<td><code>tests/persistence.rs</code></td>
+<td align="right">6</td>
+</tr>
+<tr>
+<td><code>tests/protocol_storage.rs</code></td>
+<td align="right">13</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td align="right"><strong>41</strong></td>
+</tr>
+</tbody></table>
+<h3>8.2 内置持久化测试（1）</h3>
+<table>
+<thead>
+<tr>
+<th>测试名 → 文件</th>
+<th>被测函数 / 模块</th>
+<th>验证行为</th>
+<th>防止的 bug</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>injected_write_failure_preserves_memory_and_poison_writes</code> → <code>src/persistence.rs:210</code></td>
+<td><code>PersistentStore::append_record/set/delete/get</code>、<code>writable</code></td>
+<td>注入 WAL 写失败后，本次内存不变、旧值可读、后续 set/delete 永久拒绝、WAL 字节不变</td>
+<td>持久化失败却更新内存或返回成功；失败后继续写坏文件</td>
+</tr>
+</tbody></table>
+<h3>8.3 客户端测试（6）</h3>
+<table>
+<thead>
+<tr>
+<th>测试名 → 文件</th>
+<th>被测函数 / 模块</th>
+<th>验证行为</th>
+<th>防止的 bug</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>defaults_help_and_strict_options_are_stable</code> → <code>tests/client.rs:16</code></td>
+<td><code>ClientConfig::parse</code>、<code>parse_client_args</code></td>
+<td>默认地址、<code>--server</code>、<code>--help</code>、重复/未知/缺参/位置参数错误码</td>
+<td>CLI 参数被静默接受或默认值漂移</td>
+</tr>
+<tr>
+<td><code>local_command_errors_do_not_send_network_requests</code> → <code>tests/client.rs:57</code></td>
+<td><code>run_with_io</code>、<code>parse_command</code></td>
+<td>本地 <code>get</code> 缺参只显示错误，不调用 send；后续 ping/quit 继续</td>
+<td>明知非法的命令仍发到服务器；本地错误终止循环</td>
+</tr>
+<tr>
+<td><code>success_responses_are_friendly_and_quit_says_bye</code> → <code>tests/client.rs:80</code></td>
+<td><code>run_with_io</code>、<code>display_response</code></td>
+<td>7 种响应显示为 created/replaced/value/deleted/keys/status/pong/bye</td>
+<td>响应枚举与用户显示错配</td>
+</tr>
+<tr>
+<td><code>quoted_values_and_server_errors_continue_until_quit</code> → <code>tests/client.rs:125</code></td>
+<td><code>parse_command</code>、错误显示、客户端循环</td>
+<td><code>NOT_FOUND</code> 后继续；引号值保留空格；最终 quit</td>
+<td>服务端业务错误误终止客户端；值空格丢失</td>
+</tr>
+<tr>
+<td><code>quit_only_exits_after_receiving_quit_response</code> → <code>tests/client.rs:147</code></td>
+<td><code>run_with_io</code> 的 quit 判定</td>
+<td>第一次 quit 若收到错误不退出，收到 <code>ResponseData::Quit</code> 才退出</td>
+<td>仅凭本地输入 quit 就提前关闭，漏掉服务器响应</td>
+</tr>
+<tr>
+<td><code>disconnect_and_bad_response_are_reported_and_stop_client</code> → <code>tests/client.rs:166</code></td>
+<td>接收闭包、<code>parse_response_line</code>、错误打印</td>
+<td>断开和非法 JSON 响应均打印并返回 Err</td>
+<td>客户端在协议已失步后仍继续，或吞掉错误</td>
+</tr>
+</tbody></table>
+<h3>8.4 网络测试（15）</h3>
+<table>
+<thead>
+<tr>
+<th>测试名 → 文件</th>
+<th>被测函数 / 模块</th>
+<th>验证行为</th>
+<th>防止的 bug</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>frame_reader_handles_split_sticky_and_crlf_frames</code> → <code>tests/network.rs:110</code></td>
+<td><code>protocol::read_frame</code></td>
+<td>分段、多个粘连帧、CRLF 被逐帧读取</td>
+<td>把一次 TCP read 当成一条消息；吞掉下一帧</td>
+</tr>
+<tr>
+<td><code>tcp_crlf_and_empty_frames_continue_to_a_later_ping</code> → <code>tests/network.rs:124</code></td>
+<td><code>handle_connection</code>、请求解析</td>
+<td>CRLF 合法；空帧报错后同连接 ping 仍成功</td>
+<td>单条完整协议错误误断开连接</td>
+</tr>
+<tr>
+<td><code>split_and_sticky_requests_receive_ordered_responses</code> → <code>tests/network.rs:148</code></td>
+<td><code>read_frame</code>、连接循环、dispatch</td>
+<td>请求拆两次发送，并与下一请求粘连；响应顺序正确</td>
+<td>分段解析失败、粘包串帧、响应乱序</td>
+</tr>
+<tr>
+<td><code>invalid_utf8_and_json_are_errors_then_ping_continues</code> → <code>tests/network.rs:183</code></td>
+<td><code>parse_request_bytes</code>、<code>decode_json</code></td>
+<td>分别返回 <code>INVALID_UTF8</code>、<code>INVALID_JSON</code>，随后 ping 成功</td>
+<td>非 UTF-8 panic；错误后连接不可继续</td>
+</tr>
+<tr>
+<td><code>oversized_request_is_discarded_then_ping_continues</code> → <code>tests/network.rs:207</code></td>
+<td><code>read_frame</code> 的 TooLarge 路径</td>
+<td>超长且有 LF 的帧丢弃到边界，返回 <code>FRAME_TOO_LARGE</code>，下一帧正常</td>
+<td>超长帧残留污染下一请求或无限占内存</td>
+</tr>
+<tr>
+<td><code>tcp_payload_at_exact_frame_limit_is_accepted</code> → <code>tests/network.rs:230</code></td>
+<td><code>read_frame</code> 大小边界</td>
+<td>正好 64 KiB payload 不被误判超长</td>
+<td><code>&gt;</code> / <code>&gt;=</code> 边界错误</td>
+</tr>
+<tr>
+<td><code>oversized_unterminated_request_returns_error_and_closes_connection</code> → <code>tests/network.rs:249</code></td>
+<td>EOF + 超长未终止处理</td>
+<td>返回协议错误后关闭；测试容许 <code>FRAME_TOO_LARGE</code> 或 <code>INVALID_REQUEST</code></td>
+<td>未终止帧导致死等或连接不关闭；注意断言比文档宽松</td>
+</tr>
+<tr>
+<td><code>incomplete_eof_gets_invalid_request_before_connection_close</code> → <code>tests/network.rs:276</code></td>
+<td><code>Frame::Incomplete</code>、<code>handle_connection</code></td>
+<td>EOF 前有非空未终止内容时先回 <code>INVALID_REQUEST</code> 再关闭</td>
+<td>静默吞掉半帧</td>
+</tr>
+<tr>
+<td><code>disconnected_client_does_not_affect_another_connection</code> → <code>tests/network.rs:295</code></td>
+<td>每连接线程和错误隔离</td>
+<td>一个客户端异常断开，另一连接仍能 ping</td>
+<td>单连接错误终止监听或其他线程</td>
+</tr>
+<tr>
+<td><code>idle_client_does_not_hold_storage_lock</code> → <code>tests/network.rs:308</code></td>
+<td>锁范围</td>
+<td>一个连接停在 read，另一连接仍可 set/get</td>
+<td>网络等待期间持有全局 Mutex</td>
+</tr>
+<tr>
+<td><code>poisoned_shared_mutex_returns_storage_error_and_listener_continues</code> → <code>tests/network.rs:334</code></td>
+<td><code>dispatch</code> 的 lock 错误映射</td>
+<td>Mutex 中毒返回 <code>STORAGE_ERROR</code>，监听线程仍运行</td>
+<td><code>unwrap</code> 导致连接/服务器 panic</td>
+</tr>
+<tr>
+<td><code>eight_clients_can_write_independent_keys_concurrently</code> → <code>tests/network.rs:360</code></td>
+<td><code>Arc&lt;Mutex&lt;PersistentStore&gt;&gt;</code>、线程模型</td>
+<td>8 客户端并发写不同键并读回，status 为 8</td>
+<td>丢写、共享状态分裂、基本并发错误</td>
+</tr>
+<tr>
+<td><code>oversized_keys_response_is_replaced_by_small_error</code> → <code>tests/network.rs:395</code></td>
+<td><code>write_response</code> 降级路径</td>
+<td>正常 keys 响应超 64 KiB 时发送小型 <code>FRAME_TOO_LARGE</code></td>
+<td>截断 JSON、发送半帧或直接卡死</td>
+</tr>
+<tr>
+<td><code>confirmed_writes_survive_server_stop_and_restart</code> → <code>tests/network.rs:414</code></td>
+<td>TCP set + WAL + <code>PersistentStore::open</code></td>
+<td>服务器确认的网络写入在停止并重开同一 WAL 后仍存在</td>
+<td>成功响应早于持久化；网络路径未真正写 WAL</td>
+</tr>
+<tr>
+<td><code>server_config_rejects_unknown_duplicate_and_missing_options</code> → <code>tests/network.rs:441</code></td>
+<td><code>ServerConfig::parse</code></td>
+<td>默认、help、未知、重复、缺参、非法地址均稳定</td>
+<td>服务端参数误解析或静默忽略</td>
+</tr>
+</tbody></table>
+<h3>8.5 持久化测试（6）</h3>
+<table>
+<thead>
+<tr>
+<th>测试名 → 文件</th>
+<th>被测函数 / 模块</th>
+<th>验证行为</th>
+<th>防止的 bug</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>open_creates_missing_parent_and_empty_wal</code> → <code>tests/persistence.rs:18</code></td>
+<td><code>PersistentStore::open</code></td>
+<td>自动创建父目录和空 WAL；空 WAL 可打开</td>
+<td>首次启动因目录不存在失败；空文件被误判损坏</td>
+</tr>
+<tr>
+<td><code>set_overwrite_delete_and_restart_recover_final_state</code> → <code>tests/persistence.rs:29</code></td>
+<td><code>set/delete/open/recover_wal</code></td>
+<td>set、覆盖、delete 后重启只恢复最终状态</td>
+<td>重放顺序错、覆盖丢失、delete 未恢复</td>
+</tr>
+<tr>
+<td><code>delete_missing_does_not_append_a_record</code> → <code>tests/persistence.rs:50</code></td>
+<td><code>PersistentStore::delete</code></td>
+<td>删除不存在键为 <code>NOT_FOUND</code>，WAL 长度不变</td>
+<td>把失败操作写入 WAL，导致恢复损坏</td>
+</tr>
+<tr>
+<td><code>every_corrupt_wal_is_rejected_with_line_number_and_unchanged_bytes</code> → <code>tests/persistence.rs:63</code></td>
+<td><code>recover_wal</code>、<code>WalRecord</code> 严格反序列化</td>
+<td>空行、坏 JSON、未知 op、缺/多字段、非法键值、删不存在键、非 UTF-8、缺 LF 全部拒绝；原字节不变</td>
+<td>悄悄跳过、修复或覆盖损坏 WAL；错误无行号</td>
+</tr>
+<tr>
+<td><code>later_line_corruption_reports_one_based_line_number</code> → <code>tests/persistence.rs:123</code></td>
+<td><code>recover_wal</code> 行号</td>
+<td>第二行损坏准确报告 line 2</td>
+<td>行号从 0 开始或定位错误</td>
+</tr>
+<tr>
+<td><code>oversized_wal_record_is_rejected_without_rewriting_original_bytes</code> → <code>tests/persistence.rs:135</code></td>
+<td><code>read_frame</code> 的 WAL TooLarge 路径</td>
+<td>超长 WAL 拒绝启动且文件不被重写</td>
+<td>启动时截断/覆盖证据或无界分配</td>
+</tr>
+</tbody></table>
+<h3>8.6 协议与内存存储测试（13）</h3>
+<table>
+<thead>
+<tr>
+<th>测试名 → 文件</th>
+<th>被测函数 / 模块</th>
+<th>验证行为</th>
+<th>防止的 bug</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>all_public_error_codes_keep_the_wire_names_and_trigger_paths</code> → <code>tests/protocol_storage.rs:16</code></td>
+<td><code>ErrorCode</code>、协议/存储公开入口</td>
+<td>所有错误码的 wire 名和典型触发路径稳定</td>
+<td>重命名破坏协议；某错误无法实际产生</td>
+</tr>
+<tr>
+<td><code>every_cli_command_maps_to_a_wire_request</code> → <code>tests/protocol_storage.rs:90</code></td>
+<td><code>parse_command</code></td>
+<td>set/get/delete/keys/status/ping/quit 映射到正确 <code>Request</code></td>
+<td>CLI 命令和协议枚举错配</td>
+</tr>
+<tr>
+<td><code>quoted_cli_value_preserves_spaces_without_relaxing_argument_rules</code> → <code>tests/protocol_storage.rs:123</code></td>
+<td><code>tokenize</code>、<code>parse_command</code></td>
+<td>JSON 引号保留值中空格，同时仍拒绝参数边界错误</td>
+<td>空格值拆散；引号规则过宽</td>
+</tr>
+<tr>
+<td><code>malformed_cli_commands_fail_loudly</code> → <code>tests/protocol_storage.rs:143</code></td>
+<td><code>parse_command</code></td>
+<td>空命令、未知命令、多参、未闭合引号返回确定错误</td>
+<td>非法命令被猜测执行或 panic</td>
+</tr>
+<tr>
+<td><code>request_and_response_json_lines_round_trip</code> → <code>tests/protocol_storage.rs:166</code></td>
+<td><code>encode/parse request/response</code></td>
+<td>中文、空格值、keys 响应往返保持相等并带 LF</td>
+<td>JSON 编解码丢信息；忘记行终止符</td>
+</tr>
+<tr>
+<td><code>response_json_uses_the_frozen_nested_success_and_error_shapes</code> → <code>tests/protocol_storage.rs:191</code></td>
+<td><code>Response</code> Serde 形状</td>
+<td>成功/失败 JSON 精确嵌套结构和字段名固定</td>
+<td>wire schema 无意变化或输出 null 字段</td>
+</tr>
+<tr>
+<td><code>json_lines_require_a_terminated_nonempty_frame</code> → <code>tests/protocol_storage.rs:262</code></td>
+<td><code>parse_request_line/parse_response_line</code></td>
+<td>空帧和没有 LF 的帧为 <code>INVALID_REQUEST</code></td>
+<td>接受模糊边界，造成粘包无法分割</td>
+</tr>
+<tr>
+<td><code>json_schema_rejects_unknown_missing_extra_and_wrong_type_fields</code> → <code>tests/protocol_storage.rs:291</code></td>
+<td><code>validate_request_fields</code></td>
+<td>请求缺字段、未知字段、错误类型按固定错误码拒绝</td>
+<td>Serde 默认行为导致错误分类漂移或忽略字段</td>
+</tr>
+<tr>
+<td><code>response_json_shape_is_strict_at_the_public_decode_entries</code> → <code>tests/protocol_storage.rs:348</code></td>
+<td><code>validate_response_fields/data/error</code>、<code>parse_response_*</code></td>
+<td>响应成功/失败互斥、字段/类型/count/错误码严格</td>
+<td>客户端接受自相矛盾或未知响应</td>
+</tr>
+<tr>
+<td><code>protocol_limits_and_utf8_errors_have_stable_codes</code> → <code>tests/protocol_storage.rs:396</code></td>
+<td>帧限制、<code>parse_*_bytes</code></td>
+<td>超长和非法 UTF-8 的错误码稳定</td>
+<td>字节/字符边界混乱或 UTF-8 panic</td>
+</tr>
+<tr>
+<td><code>key_and_value_boundaries_are_measured_in_utf8_bytes</code> → <code>tests/protocol_storage.rs:412</code></td>
+<td><code>validate_key/value</code></td>
+<td>256 字节键、16 KiB 值边界；多字节字符按 UTF-8 字节计</td>
+<td>用字符数代替协议规定的字节数；off-by-one</td>
+</tr>
+<tr>
+<td><code>chinese_and_space_values_are_valid_business_data</code> → <code>tests/protocol_storage.rs:466</code></td>
+<td><code>Store::set/get</code>、值校验</td>
+<td>中文键值可用，值可包含普通空格</td>
+<td>把所有非 ASCII 或空白都错误拒绝</td>
+</tr>
+<tr>
+<td><code>crud_overwrite_sorting_and_count_match_store_contract</code> → <code>tests/protocol_storage.rs:476</code></td>
+<td><code>Store::set/get/delete/keys/len/status</code></td>
+<td>CRUD、覆盖标志、<code>NOT_FOUND</code>、字典序、计数</td>
+<td>内存业务语义错误</td>
+</tr>
+</tbody></table>
+<h3>8.7 用户要求的重点覆盖矩阵</h3>
+<table>
+<thead>
+<tr>
+<th>重点</th>
+<th>已找到的主要测试</th>
+<th>边界说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>CRUD</td>
+<td><code>crud_overwrite_sorting_and_count_match_store_contract</code>；客户端显示测试；网络并发测试</td>
+<td>内存层最完整，网络层通过若干场景组合覆盖</td>
+</tr>
+<tr>
+<td>覆盖写</td>
+<td><code>crud_overwrite_sorting_and_count_match_store_contract</code>；<code>set_overwrite_delete_and_restart_recover_final_state</code></td>
+<td>同时验证 <code>replaced=true</code> 和重启最终值</td>
+</tr>
+<tr>
+<td><code>NOT_FOUND</code></td>
+<td>协议存储测试、<code>delete_missing_does_not_append_a_record</code>、客户端错误显示</td>
+<td>没有独立命名的“网络 NOT_FOUND”测试</td>
+</tr>
+<tr>
+<td>JSON 错误</td>
+<td>schema 两个严格性测试；<code>invalid_utf8_and_json_are_errors_then_ping_continues</code></td>
+<td>请求和响应都覆盖</td>
+</tr>
+<tr>
+<td>TCP 分段</td>
+<td><code>split_and_sticky_requests_receive_ordered_responses</code></td>
+<td>覆盖请求方向；没有专门模拟“服务端响应被 TCP 分段”的客户端测试</td>
+</tr>
+<tr>
+<td>TCP 粘包</td>
+<td>同上；<code>frame_reader_handles_split_sticky_and_crlf_frames</code></td>
+<td>验证多帧保留和顺序</td>
+</tr>
+<tr>
+<td>非 UTF-8</td>
+<td>协议公开入口、网络请求、WAL 损坏</td>
+<td>请求、响应解析入口和 WAL 均有覆盖</td>
+</tr>
+<tr>
+<td>超长帧</td>
+<td>网络超长/精确上限/未终止/响应过大；WAL 超长</td>
+<td>未终止超长测试允许两种错误码，实际源码走 <code>INVALID_REQUEST</code></td>
+</tr>
+<tr>
+<td>双客户端</td>
+<td>文档有手工双客户端演示；自动测试有 8 客户端并发、断开隔离、空闲锁测试</td>
+<td><strong>没有“恰好两个客户端”自动化测试</strong></td>
+</tr>
+<tr>
+<td>WAL 重启恢复</td>
+<td>持久化重启测试；<code>confirmed_writes_survive_server_stop_and_restart</code></td>
+<td>同时覆盖直接 API 和 TCP 确认写入</td>
+</tr>
+<tr>
+<td>WAL 截断/坏 JSON</td>
+<td><code>every_corrupt_wal...</code>、<code>later_line_corruption...</code>、<code>oversized_wal...</code></td>
+<td>拒绝启动、行号和原文件不变均验证</td>
+</tr>
+<tr>
+<td>持久化后状态一致性</td>
+<td>重启测试；网络重启；注入写失败内置测试</td>
+<td>没有逐字节断言多客户端 WAL 永不交错；通过单 Mutex 设计和恢复结果间接保证</td>
+</tr>
+</tbody></table>
+<hr>
+<h2>9. 答辩高风险点：15 个追问与标准答案</h2>
+<h3>1. 为什么是 <code>Arc&lt;Mutex&lt;PersistentStore&gt;&gt;</code>，不是 <code>Mutex&lt;PersistentStore&gt;</code>？</h3>
+<p><code>Mutex</code> 只解决互斥，不提供多个线程共同拥有对象的能力；把普通 <code>Mutex</code> 借用移入 <code>thread::spawn</code> 无法满足线程可能长期存在的生命周期。<code>Arc</code> 让每个连接线程拥有一个引用计数句柄，<code>Mutex</code> 再保证同一时刻只有一个线程进入共享状态。</p>
+<h3>2. 为什么 Mutex 包住整个 <code>PersistentStore</code>，而不是只包 <code>BTreeMap</code>？</h3>
+<p>一次写操作必须把 WAL 追加顺序和 BTreeMap 修改顺序绑定起来。如果只锁映射而 WAL 句柄在锁外，多线程可能交错写 WAL，或 WAL 顺序与内存提交顺序不一致；当前一个 Mutex 同时保护 Store、File 和 <code>writable</code> 状态。</p>
+<h3>3. 锁在哪里获得、什么时候释放，为什么网络读写不持锁？</h3>
+<p>锁只在 <code>server::dispatch</code> 各存储分支的 <code>store.lock()</code> 获得，MutexGuard 在 <code>.and_then/.map</code> 闭包返回时释放。<code>read_frame</code>、JSON 解析、Response 编码和 TCP 写入都在锁外，避免空闲或慢客户端阻塞其他连接。</p>
+<h3>4. <code>Arc::clone(&amp;store)</code> 会不会复制整份 KV 数据？项目里哪些 clone 真会复制数据？</h3>
+<p>不会；它只复制 Arc 句柄并增加引用计数，所有线程仍看到同一个 <code>PersistentStore</code>。<code>tokens[i].clone()</code>、<code>BTreeMap::get(...).cloned()</code> 和 <code>keys().cloned()</code> 才会复制 <code>String</code> 数据；这样响应在释放锁后仍拥有所需内容。</p>
+<h3>5. 为什么每个连接一个线程？它有什么边界？</h3>
+<p>源码在每次 <code>accept</code> 后直接 <code>thread::spawn</code>，实现简单，每个阻塞 <code>TcpStream</code> 有独立执行流，连接错误也相互隔离。代价是线程数没有上限、JoinHandle 被丢弃、生产 <code>run</code> 没有优雅停止和等待连接线程的流程；这是课程项目的明确规模边界。</p>
+<h3>6. 服务端和客户端为什么都调用 <code>TcpStream::try_clone</code>？</h3>
+<p><code>BufReader</code> 需要拥有一个流并保留读取缓冲，同时代码还要独立写响应/请求。<code>try_clone</code> 得到同一底层 socket 的第二个句柄，不是复制 TCP 内容；原句柄进入 <code>BufReader</code>，克隆句柄负责写。</p>
+<h3>7. TCP 没有消息边界，项目如何处理分段和粘包？</h3>
+<p><code>read_frame&lt;R: BufRead&gt;</code> 用 <code>fill_buf/consume</code> 持续寻找 LF：一帧可跨多次接收，LF 后的字节留给下一次调用。它只保留至多约 64 KiB 的当前帧，超长且有 LF 时丢弃到该 LF，再返回 <code>Frame::TooLarge</code>，所以不会把粘包误当一条 JSON。</p>
+<h3>8. 为什么用 <code>BTreeMap</code>，不用 <code>HashMap</code>？</h3>
+<p>需求规定 <code>keys</code> 按字典序返回。<code>BTreeMap::keys()</code> 本身就是有序迭代，<code>Store::keys</code> 只需 clone 并 collect；若用 <code>HashMap</code>，每次 keys 都要额外排序，且迭代顺序不稳定。</p>
+<h3>9. 为什么 <code>PersistentStore</code> 和 <code>Store</code> 都校验键值，看起来重复？</h3>
+<p><code>Store</code> 是独立公开的内存存储，必须保护自身不变量；<code>PersistentStore</code> 必须在写 WAL <strong>之前</strong>拒绝非法数据，防止把坏记录落盘。恢复又通过 <code>Store::set/delete</code> 复用同一规则，因此网络写入和 WAL 重放不会采用不同限制。</p>
+<h3>10. 为什么一定先写 WAL，再改 BTreeMap？中间崩溃会怎样？</h3>
+<p>如果先改内存再落盘，服务器可能已经返回成功或暂时可读，但重启后数据消失。当前在同一锁内先 <code>write_all/flush/sync_data</code>，再修改映射；若同步后、内存更新前进程崩溃，重启会从已落盘记录重放出来，而客户端当时也不会收到由后续代码生成的成功响应。</p>
+<h3>11. <code>flush</code> 和 <code>sync_data</code> 有什么区别，为什么两个都调用？</h3>
+<p><code>flush</code> 完成 Rust 写入接口层面的刷新，<code>sync_data</code> 请求操作系统把文件数据同步到持久存储；只有 <code>flush</code> 不能表达项目要求的耐久边界。实际持久性仍受操作系统、文件系统和硬件保证约束，但代码已使用标准库提供的同步数据接口。</p>
+<h3>12. WAL 写到一半失败后，为什么把 <code>writable</code> 永久设为 false？</h3>
+<p>I/O 失败时可能已经产生部分尾记录，进程无法可靠判断文件当前位置是否仍安全。源码因此不更新内存，并让后续 set/delete 全部返回持久化错误；读操作仍可用，重启时严格恢复会检查 WAL 是否损坏。</p>
+<h3>13. 启动恢复为什么不忽略最后一条坏记录？</h3>
+<p><code>recover_wal</code> 把缺 LF、空行、超长、坏 JSON、未知字段/操作和非法业务记录都视为损坏，并带行号返回错误。这样不会在用户不知情时丢掉一个“可能已确认”的写入，也不会自动覆盖取证所需的原文件；代价是人工处理损坏后才能启动。</p>
+<h3>14. 为什么既手工检查 JSON 字段，又让 Serde <code>deny_unknown_fields</code> 反序列化？<code>Result/?</code> 怎么参与？</h3>
+<p>手工 <code>validate_request_fields</code> 用于把缺字段、多字段和类型错误映射到项目规定的稳定错误码；Serde 再负责真正构造强类型枚举，并作为第二道结构检查。每一步返回 <code>Result</code>，<code>?</code> 在失败处立即退出；<code>From&lt;io::Error/serde_json::Error&gt;</code> 和 <code>AppError::code</code> 最终把内部错误统一变成协议响应。</p>
+<h3>15. 项目有 <code>Store::status</code> 和 <code>PersistentStore::status</code>，为什么服务端 <code>status</code> 实际调用 <code>len()</code>？</h3>
+<p><code>server::dispatch</code> 的 <code>Request::Status</code> 分支在锁内直接 <code>.map(|store| store.len())</code>，再构造 <code>ResponseData::Status { count }</code>；所以网络真实路径没有调用两个 <code>status()</code> 方法。当前行为与文档相同，因为 <code>status()</code> 也只是包装 <code>len()</code>，但答辩追踪代码时应说清真实调用，而不是按函数名猜测。</p>
+<hr>
+<h2>10. 实现与文档差异</h2>
+<p>对照文件：<code>docs/架构设计.md</code>、<code>docs/协议与持久化设计.md</code>、<code>docs/需求规格与验收.md</code>、<code>docs/测试环境与演示.md</code>。以下只报告事实，不修改源码或原文档。</p>
+<h3>10.1 一致的关键设计</h3>
+<p>当前源码确实实现了文档中的这些核心点：</p>
+<ul>
+<li>默认地址 <code>127.0.0.1:7878</code>，默认 WAL <code>data/kv.wal</code>；</li>
+<li>每连接一个线程，共享 <code>Arc&lt;Mutex&lt;PersistentStore&gt;&gt;</code>；</li>
+<li>JSON Lines、LF/CRLF、64 KiB 帧限制；</li>
+<li><code>BTreeMap&lt;String, String&gt;</code> 和字典序 keys；</li>
+<li>写入顺序 <code>append → flush → sync_data → BTreeMap</code>；</li>
+<li>网络读、协议解析和响应发送不持存储锁；</li>
+<li>WAL 严格恢复，损坏带行号，原文件不被重写；</li>
+<li><code>get/delete</code> 缺失键为 <code>NOT_FOUND</code>；</li>
+<li>响应过大时降级为小型 <code>FRAME_TOO_LARGE</code>；</li>
+<li>当前自动测试数量确实为 41，且本次复核运行全部通过。</li>
+</ul>
+<h3>10.2 已确认的差异或表述边界</h3>
+<table>
+<thead>
+<tr>
+<th>文档陈述</th>
+<th>当前源码 / 测试事实</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>架构设计.md</code> 第 1 节称“持久化层只负责记录和恢复；修改操作由存储层统一协调”</td>
+<td>顺序协调实际写在 <code>src/persistence.rs:58-87</code> 的 <code>PersistentStore::set/delete</code>；<code>Store</code> 只负责内存 CRUD</td>
+<td>分层图总体正确，但“谁协调先 WAL 后内存”的文字不准确；实际协调者是持久化包装层</td>
+</tr>
+<tr>
+<td><code>架构设计.md</code> 第 4 节称“单条请求错误只终止当前连接循环”</td>
+<td>对有完整 LF 边界的 UTF-8/JSON/字段错误，<code>handle_connection</code> 生成错误响应后继续 loop；只有 EOF、写失败、读失败或 <code>Frame::Incomplete</code> 等关闭</td>
+<td>原文“终止”与真实实现及同文前述“其他错误继续循环”冲突；源码行为是完整请求错误后继续</td>
+</tr>
+<tr>
+<td>文档把存储层写为 <code>set/get/delete/keys/status</code> 调用链</td>
+<td>服务端 Status 分支实际调用 <code>PersistentStore::len()</code>，没有调用现成的 <code>PersistentStore::status()</code> / <code>Store::status()</code></td>
+<td>输出语义一致，但真实函数调用链与按文档名称推断不同</td>
+</tr>
+<tr>
+<td><code>协议与持久化设计.md</code> 同时规定“超长帧返回 <code>FRAME_TOO_LARGE</code>”和“EOF 前未结束内容是协议错误”</td>
+<td>当前 <code>read_frame</code> 在 EOF 分支只看 <code>frame.is_empty()</code>，即使此前已超长也返回 <code>Frame::Incomplete</code>；服务端因此返回 <code>INVALID_REQUEST</code> 并关闭。测试允许 <code>FRAME_TOO_LARGE</code> 或 <code>INVALID_REQUEST</code></td>
+<td>“超长且未终止”两条规则优先级未固定；当前源码确定选择 <code>INVALID_REQUEST</code>，测试断言比“超长必为 FRAME_TOO_LARGE”更宽松</td>
+</tr>
+<tr>
+<td><code>需求规格与验收.md</code> / <code>测试环境与演示.md</code> 有“双客户端”和“并发恢复”验收描述</td>
+<td>自动测试有 8 客户端并发写、连接隔离、空闲锁与网络写入重启恢复；没有恰好双客户端的自动化测试，也没有逐字节检查并发 WAL 是否交错</td>
+<td>文档中的双客户端是手工演示记录，不能说成同名自动化测试；自动覆盖更偏 8 客户端独立键场景</td>
+</tr>
+<tr>
+<td>文档展示真实 <code>kv-client</code> / <code>kv-server</code> 进程演示</td>
+<td><code>tests/network.rs</code> 使用真实 TCP，但直接调用库函数启动服务器，并用测试内 <code>WireClient</code>，不是拉起两个发布二进制进程</td>
+<td>自动测试证明库级真实 TCP 行为；真实进程演示属于文档记录，不属于这 41 个自动测试</td>
+</tr>
+<tr>
+<td>文档覆盖 TCP 分段/粘包</td>
+<td>自动测试完整覆盖请求方向分段和粘包；客户端虽然复用 <code>read_frame</code>，但没有专门让“服务端响应分段发送”的测试</td>
+<td>实现可以处理响应分段，但该方向没有独立自动化证据</td>
+</tr>
+<tr>
+<td>文档记录 2026-08-31 Windows 手工验收、SHA-256 不变、Linux 尚未实测</td>
+<td>当前源码和测试能复核 41 测试与 WAL 原字节不变测试，但不能从仓库代码独立证明历史手工操作、日期或 Linux 未执行事实</td>
+<td>这些应准确称为“文档记录”，不能包装成源码推导结论</td>
+</tr>
+<tr>
+<td>文档强调平台无关源码并称 Linux 尚未实测</td>
+<td>Rust 源码主要使用标准库平台无关接口；但 <code>rust-toolchain.toml</code> 明确固定 <code>1.98.0-x86_64-pc-windows-msvc</code></td>
+<td>源码设计基本平台无关，当前工具链配置本身是 Windows 专用；Linux 复核前需处理工具链选择</td>
+</tr>
+</tbody></table>
+<h3>10.3 自动化测试没有直接证明的内容</h3>
+<p>这些不是“实现一定有 bug”，而是答辩时不能把它们说成已有自动测试证据：</p>
+<ol>
+<li>恰好两个客户端同时操作的独立自动测试；</li>
+<li>多线程 WAL 文件内容逐字节无交错；</li>
+<li>多线程写同一个键时某个确定线程必然成为最终值；</li>
+<li>真实 <code>kv-client.exe</code> 与 <code>kv-server.exe</code> 子进程的完整 CRUD 自动化；</li>
+<li>服务端响应被刻意拆成多个 TCP 包时的客户端专项测试；</li>
+<li>Linux 构建、测试与运行结果。</li>
+</ol>
+<h3>10.4 最终答辩口径</h3>
+<p>可以准确陈述：<strong>当前实现与四份设计文档的核心架构和持久化规则总体一致，41 个自动测试当前全部通过。需要诚实区分手工双客户端演示与 8 客户端自动测试，并说明超长未终止帧、<code>status</code> 实际调用、持久化协调所在模块和 Windows 工具链配置这些真实细节。</strong></p>
+</main></body></html>
