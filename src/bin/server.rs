@@ -1,9 +1,5 @@
 #[tokio::main]
 async fn main() {
-    // if let Err(error) = rust_kv_store::server::run(Default::default()) {
-    //     eprintln!("kv-server: {error}");
-    //     std::process::exit(1);
-    // }
     match rust_kv_store::server::ServerConfig::parse(std::env::args()) {
         Ok(None) => {
             print!("{}", rust_kv_store::server::help_text());
