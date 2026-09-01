@@ -3,7 +3,7 @@ name = "rust-kv-store"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
-description = "A from-scratch framework for a persistent TCP key-value store"
+description = "A persistent, multi-client key-value store written in Rust"
 license = "MIT"
 
 [[bin]]
@@ -17,3 +17,6 @@ path = "src/bin/client.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

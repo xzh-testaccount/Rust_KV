@@ -1,4 +1,6 @@
 /target/
 /data/
+/mvp/target/
+/mvp/data/
 *.log
 .codegraph/

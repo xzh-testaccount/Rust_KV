@@ -1,127 +1,78 @@
-//! Validated, ordered in-memory key-value storage.
+//! Ordered, in-memory key-value storage.
+//!
+//! This module deliberately owns only the in-memory boundary.  Validation,
+//! persistence, and protocol concerns belong to higher layers that can be
+//! added in later iterations.
 
-use crate::error::{AppError, Result};
-use crate::protocol::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// The result of inserting a key/value pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SetOutcome {
-    pub replaced: bool,
-}
-
-/// The result of deleting an existing key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeleteOutcome {
-    pub deleted: bool,
-}
-
-/// Current storage statistics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoreStatus {
-    pub count: usize,
-}
-
-/// Ordered in-memory key-value store.
+/// A small ordered key-value store.
 #[derive(Debug, Default)]
 pub struct Store {
     entries: BTreeMap<String, String>,
 }
 
 impl Store {
+    /// Creates an empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Inserts or overwrites a value after validating both fields.
-    pub fn set(&mut self, key: &str, value: &str) -> Result<SetOutcome> {
-        validate_key(key)?;
-        validate_value(value)?;
-        let replaced = self
-            .entries
-            .insert(key.to_owned(), value.to_owned())
-            .is_some();
-        Ok(SetOutcome { replaced })
+    /// Inserts `value` under `key` and returns the value previously stored.
+    pub fn set<K, V>(&mut self, key: K, value: V) -> Option<String>
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.entries.insert(key.into(), value.into())
     }
 
-    /// Returns a copy of the value, or a stable not-found error.
-    pub fn get(&self, key: &str) -> Result<String> {
-        validate_key(key)?;
-        self.entries
-            .get(key)
-            .cloned()
-            .ok_or_else(|| AppError::NotFound(format!("key {key:?} does not exist")))
+    /// Returns the value for `key`, if it exists.
+    pub fn get<K>(&self, key: K) -> Option<&str>
+    where
+        K: AsRef<str>,
+    {
+        self.entries.get(key.as_ref()).map(String::as_str)
     }
 
-    /// Removes an existing key, or returns a stable not-found error.
-    pub fn delete(&mut self, key: &str) -> Result<DeleteOutcome> {
-        validate_key(key)?;
-        if self.entries.remove(key).is_some() {
-            Ok(DeleteOutcome { deleted: true })
-        } else {
-            Err(AppError::NotFound(format!("key {key:?} does not exist")))
-        }
+    /// Removes `key` and returns its value, if it exists.
+    pub fn delete<K>(&mut self, key: K) -> Option<String>
+    where
+        K: AsRef<str>,
+    {
+        self.entries.remove(key.as_ref())
     }
 
-    /// Returns all keys in lexicographic order.
+    /// Returns a snapshot of all keys in `BTreeMap` order.
     pub fn keys(&self) -> Vec<String> {
         self.entries.keys().cloned().collect()
     }
 
+    /// Returns the number of stored entries.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Returns whether the store has no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-
-    pub(crate) fn contains_key(&self, key: &str) -> bool {
-        self.entries.contains_key(key)
-    }
-
-    pub fn status(&self) -> StoreStatus {
-        StoreStatus { count: self.len() }
-    }
 }
 
-/// Backwards-compatible name for callers of the original skeleton.
-pub type Storage = Store;
+#[cfg(test)]
+mod tests {
+    use super::Store;
 
-pub fn validate_key(key: &str) -> Result<()> {
-    if key.is_empty() {
-        return Err(AppError::InvalidKey("key must not be empty".to_owned()));
-    }
-    if key.len() > MAX_KEY_BYTES {
-        return Err(AppError::InvalidKey(format!(
-            "key must be at most {MAX_KEY_BYTES} UTF-8 bytes"
-        )));
-    }
-    if key
-        .chars()
-        .any(|character| character.is_whitespace() || character.is_control())
-    {
-        return Err(AppError::InvalidKey(
-            "key must not contain whitespace or control characters".to_owned(),
-        ));
-    }
-    Ok(())
-}
+    #[test]
+    fn keys_are_returned_in_dictionary_order() {
+        let mut store = Store::new();
+        store.set("zeta", "last");
+        store.set("alpha", "first");
+        store.set("middle", "between");
 
-pub fn validate_value(value: &str) -> Result<()> {
-    if value.is_empty() {
-        return Err(AppError::InvalidValue("value must not be empty".to_owned()));
+        assert_eq!(
+            store.keys(),
+            vec!["alpha".to_owned(), "middle".to_owned(), "zeta".to_owned()]
+        );
     }
-    if value.len() > MAX_VALUE_BYTES {
-        return Err(AppError::InvalidValue(format!(
-            "value must be at most {MAX_VALUE_BYTES} UTF-8 bytes"
-        )));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(AppError::InvalidValue(
-            "value must not contain control characters".to_owned(),
-        ));
-    }
-    Ok(())
 }
