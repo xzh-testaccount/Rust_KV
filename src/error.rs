@@ -45,6 +45,8 @@ pub enum AppError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Protocol { code: ErrorCode, message: String },
+    Storage { message: String },
+    CorruptWal { line: usize, reason: String },
     NotImplemented(&'static str),
 }
 
@@ -57,10 +59,28 @@ impl AppError {
         }
     }
 
+    /// 创建存储错误。
+    pub fn storage(message: impl Into<String>) -> Self {
+        Self::Storage {
+            message: message.into(),
+        }
+    }
+
+    /// 创建带行号的WAL损坏错误。
+    pub fn corrupt_wal(line: usize, reason: impl Into<String>) -> Self {
+        Self::CorruptWal {
+            line,
+            reason: reason.into(),
+        }
+    }
+
     /// Returns the wire code for this error.
     pub fn code(&self) -> ErrorCode {
         match self {
-            Self::Io(_) | Self::NotImplemented(_) => ErrorCode::StorageError,
+            Self::Io(_)
+            | Self::Storage { .. }
+            | Self::CorruptWal { .. }
+            | Self::NotImplemented(_) => ErrorCode::StorageError,
             Self::Json(_) => ErrorCode::InvalidJson,
             Self::Protocol { code, .. } => *code,
         }
@@ -72,6 +92,10 @@ impl AppError {
             Self::Io(_) => "internal storage error".to_owned(),
             Self::Json(error) => error.to_string(),
             Self::Protocol { message, .. } => message.clone(),
+            Self::Storage { message } => message.clone(),
+            Self::CorruptWal { line, reason } => {
+                format!("WAL第 {line} 行损坏：{reason}")
+            }
             Self::NotImplemented(message) => (*message).to_owned(),
         }
     }
@@ -83,6 +107,10 @@ impl fmt::Display for AppError {
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::Json(error) => write!(formatter, "JSON error: {error}"),
             Self::Protocol { code, message } => write!(formatter, "{code}: {message}"),
+            Self::Storage { message } => write!(formatter, "storage error: {message}"),
+            Self::CorruptWal { line, reason } => {
+                write!(formatter, "corrupt WAL at line {line}: {reason}")
+            }
             Self::NotImplemented(feature) => write!(formatter, "not implemented: {feature}"),
         }
     }
@@ -93,7 +121,10 @@ impl std::error::Error for AppError {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::Protocol { .. } | Self::NotImplemented(_) => None,
+            Self::Protocol { .. }
+            | Self::Storage { .. }
+            | Self::CorruptWal { .. }
+            | Self::NotImplemented(_) => None,
         }
     }
 }
