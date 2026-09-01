@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{AppError, ErrorCode};
+use crate::error::{AppError, ErrorCode, Result};
+use std::io::{slef, BufRead};
 
 /// Maximum request or response payload size, excluding the trailing LF.
 pub const MAX_FRAME_BYTES: usize = 65_536;
@@ -10,6 +11,72 @@ pub const MAX_FRAME_BYTES: usize = 65_536;
 pub const MAX_KEY_BYTES: usize = 256;
 /// Maximum value size in UTF-8 bytes.
 pub const MAX_VALUE_BYTES: usize = 16 * 1024;
+
+/// 从json之中读取到的单个frame
+#[derive(Debug, PartialEq, Eq)]
+pub enum Frame {
+    /// 完整的frame 包含LF terminator
+    Line(Vec<u8>),
+
+    /// 一个过大的frame
+    TooLarge,
+
+    /// 没有读取到frame
+    Eof,
+
+    /// 一个不完整的frame
+    Incomplete,
+}
+
+/// 读取frame
+pub fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Frame> {
+    let mut frame = Vec::with_capacity(MAX_FRAME_BYTES + 1);
+    let mut oversized = false;
+
+    loop {
+        let (buffer_len, newline) = {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                return Ok(if frame.is_empty() {
+                    Frame::Eof
+                } else {
+                    Frame::Incomplete
+                });
+            }
+
+            let mut newline = None;
+            for (index, byte) in buffer.iter().enumerate() {
+                if *byte == b'\n' {
+                    newline = Some(index + 1);
+                    break;
+                }
+
+                if frame.len() < MAX_FRAME_BYTES + 1 {
+                    frame.push(*byte);
+                } else {
+                    oversized = true;
+                }
+            }
+            (buffer.len(), newline)
+        };
+
+        if let Some(consumed) = newline {
+            reader.consume(consumed);
+            if oversized {
+                return Ok(Frame::TooLarge);
+            }
+
+            let payload_len = frame.len()
+                .saturating_sub(usize::from(frame.last() == Some(&b'\r')));
+            if payload_len > MAX_FRAME_BYTES {
+                return Ok(Frame::Toolarge);
+            }
+            frame.push(b'\n');
+            return Ok(Frame::Line(frame));
+        }
+        reader.consume(buffer_len);
+    }
+}
 
 /// A command accepted by the wire protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +89,20 @@ pub enum Request {
     Status,
     Ping,
     Quit,
+}
+
+impl Request {
+    /// 在反序列化或者文本传递之后用于验证
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Set { key, value } => {
+                crate::storage::validate_key(key)?;
+                crate::storage::validate_value(value)
+            }
+            Self::Get { key } | Self::Delete { key } => crate::storage::validate_key(key),
+            Self::Keys | Self::Status | Self::Ping | Self::Quit => Ok(()),
+        }
+    }
 }
 
 /// Data carried by a successful response.
