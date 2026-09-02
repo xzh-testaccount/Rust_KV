@@ -1,43 +1,211 @@
-//! Data types for the JSON Lines protocol.
+//! JSON Lines 协议、命令解析和帧读取。
+
+use std::io::{self, BufRead};
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
-use crate::error::{AppError, ErrorCode};
+use crate::error::{AppError, ErrorCode, Result};
 
-/// Maximum request or response payload size, excluding the trailing LF.
+/// 单帧最大负载，不包含结尾的 LF。
 pub const MAX_FRAME_BYTES: usize = 65_536;
-/// Maximum key size in UTF-8 bytes.
+/// 键的最大 UTF-8 字节数。
 pub const MAX_KEY_BYTES: usize = 256;
-/// Maximum value size in UTF-8 bytes.
+/// 值的最大 UTF-8 字节数。
 pub const MAX_VALUE_BYTES: usize = 16 * 1024;
 
-/// A command accepted by the wire protocol.
+/// 从字节流中读取到的一帧。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Frame {
+    /// 完整的一行，包含结尾 LF。
+    Line(Vec<u8>),
+    /// 负载超过大小限制。
+    TooLarge,
+    /// 流正常结束且没有剩余数据。
+    Eof,
+    /// 流结束前没有读到 LF。
+    Incomplete,
+}
+
+/// 同步读取一帧。
+pub fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Frame> {
+    let mut frame = Vec::with_capacity(MAX_FRAME_BYTES + 1);
+    let mut oversized = false;
+
+    loop {
+        let (consumed, found_newline) = {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                return Ok(frame_at_eof(frame, oversized));
+            }
+
+            let newline = buffer.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(buffer.len(), |index| index + 1);
+            let payload_end = newline.unwrap_or(buffer.len());
+            append_bounded(&mut frame, &mut oversized, &buffer[..payload_end]);
+            (consumed, newline.is_some())
+        };
+
+        reader.consume(consumed);
+        if found_newline {
+            return Ok(finish_frame(frame, oversized));
+        }
+    }
+}
+
+/// 异步读取一帧。
+pub async fn read_frame_async<R>(reader: &mut R) -> io::Result<Frame>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut frame = Vec::with_capacity(MAX_FRAME_BYTES + 1);
+    let mut oversized = false;
+
+    loop {
+        let (consumed, found_newline) = {
+            let buffer = reader.fill_buf().await?;
+            if buffer.is_empty() {
+                return Ok(frame_at_eof(frame, oversized));
+            }
+
+            let newline = buffer.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(buffer.len(), |index| index + 1);
+            let payload_end = newline.unwrap_or(buffer.len());
+            append_bounded(&mut frame, &mut oversized, &buffer[..payload_end]);
+            (consumed, newline.is_some())
+        };
+
+        reader.consume(consumed);
+        if found_newline {
+            return Ok(finish_frame(frame, oversized));
+        }
+    }
+}
+
+fn append_bounded(frame: &mut Vec<u8>, oversized: &mut bool, bytes: &[u8]) {
+    let remaining = (MAX_FRAME_BYTES + 1).saturating_sub(frame.len());
+    let copied = remaining.min(bytes.len());
+    frame.extend_from_slice(&bytes[..copied]);
+    *oversized |= copied < bytes.len();
+}
+
+fn finish_frame(mut frame: Vec<u8>, oversized: bool) -> Frame {
+    if oversized {
+        return Frame::TooLarge;
+    }
+
+    let payload_len = frame
+        .len()
+        .saturating_sub(usize::from(frame.last() == Some(&b'\r')));
+    if payload_len > MAX_FRAME_BYTES {
+        return Frame::TooLarge;
+    }
+
+    frame.push(b'\n');
+    Frame::Line(frame)
+}
+
+fn frame_at_eof(frame: Vec<u8>, oversized: bool) -> Frame {
+    let payload_len = frame
+        .len()
+        .saturating_sub(usize::from(frame.last() == Some(&b'\r')));
+    if oversized || payload_len > MAX_FRAME_BYTES {
+        Frame::TooLarge
+    } else if frame.is_empty() {
+        Frame::Eof
+    } else {
+        Frame::Incomplete
+    }
+}
+
+/// 客户端可以发送的命令。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Request {
-    Set { key: String, value: String },
-    Get { key: String },
-    Delete { key: String },
+    Set {
+        key: String,
+        value: String,
+    },
+    Get {
+        key: String,
+    },
+    Delete {
+        key: String,
+    },
     Keys,
     Status,
+    #[serde(rename = "storage_status")]
+    StorageStatus,
+    Compact,
     Ping,
     Quit,
 }
 
-/// Data carried by a successful response.
+impl Request {
+    /// 反序列化后继续执行存储层的键值校验。
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Set { key, value } => {
+                crate::storage::validate_key(key)?;
+                crate::storage::validate_value(value)
+            }
+            Self::Get { key } | Self::Delete { key } => crate::storage::validate_key(key),
+            Self::Keys
+            | Self::Status
+            | Self::StorageStatus
+            | Self::Compact
+            | Self::Ping
+            | Self::Quit => Ok(()),
+        }
+    }
+}
+
+/// 成功响应携带的数据。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ResponseData {
-    Set { replaced: bool },
-    Get { value: String },
-    Delete { deleted: bool },
-    Keys { keys: Vec<String>, count: usize },
-    Status { count: usize },
+    Set {
+        replaced: bool,
+    },
+    Get {
+        value: String,
+    },
+    Delete {
+        deleted: bool,
+    },
+    Keys {
+        keys: Vec<String>,
+        count: usize,
+    },
+    Status {
+        count: usize,
+    },
+    #[serde(rename = "storage_status")]
+    StorageStatus {
+        entries: usize,
+        wal_records: u64,
+        wal_bytes: u64,
+        snapshot_bytes: u64,
+        last_sequence: u64,
+        writable: bool,
+    },
+    Compact {
+        entries: usize,
+        compact_ms: u64,
+        wal_records_before: u64,
+        wal_bytes_before: u64,
+        snapshot_bytes_before: u64,
+        last_sequence_before: u64,
+        wal_records_after: u64,
+        wal_bytes_after: u64,
+        snapshot_bytes_after: u64,
+        last_sequence_after: u64,
+    },
     Ping,
     Quit,
 }
 
-/// Details carried by a failed response.
+/// 失败响应携带的错误。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorBody {
@@ -45,10 +213,7 @@ pub struct ErrorBody {
     pub message: String,
 }
 
-/// One response corresponding to one request.
-///
-/// Constructors keep the two wire shapes mutually exclusive: successful
-/// responses contain `data`, while failed responses contain `error`.
+/// 一个请求对应一个响应。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Response {
@@ -86,40 +251,395 @@ impl Response {
     pub fn from_error(error: &AppError) -> Self {
         Self::error(error.code(), error.client_message())
     }
+
+    fn validate(&self) -> Result<()> {
+        match (self.ok, &self.data, &self.error) {
+            (true, Some(ResponseData::Keys { keys, count }), None) if keys.len() != *count => {
+                Err(invalid_response("keys count does not match keys"))
+            }
+            (true, Some(_), None) | (false, None, Some(_)) => Ok(()),
+            (true, _, _) => Err(invalid_response(
+                "successful response must contain data and no error",
+            )),
+            (false, _, _) => Err(invalid_response(
+                "failed response must contain error and no data",
+            )),
+        }
+    }
+}
+
+/// 解析一行请求。
+pub fn parse_request_line(line: &str) -> Result<Request> {
+    let payload = checked_payload(line, "request")?;
+    let value: serde_json::Value = decode_json(payload)?;
+    validate_request_fields(&value)?;
+
+    let request: Request = serde_json::from_value(value).map_err(|error| {
+        AppError::protocol(
+            ErrorCode::InvalidRequest,
+            format!("invalid request fields: {error}"),
+        )
+    })?;
+    request.validate()?;
+    Ok(request)
+}
+
+/// 从原始字节解析请求，并单独识别非法 UTF-8。
+pub fn parse_request_bytes(line: &[u8]) -> Result<Request> {
+    let text = std::str::from_utf8(line)
+        .map_err(|_| AppError::protocol(ErrorCode::InvalidUtf8, "request is not valid UTF-8"))?;
+    parse_request_line(text)
+}
+
+/// 解析一行响应。
+pub fn parse_response_line(line: &str) -> Result<Response> {
+    let payload = checked_payload(line, "response")?;
+    let value: serde_json::Value = decode_json(payload)?;
+    let response: Response = serde_json::from_value(value).map_err(|error| {
+        AppError::protocol(
+            ErrorCode::InvalidRequest,
+            format!("invalid response fields: {error}"),
+        )
+    })?;
+    response.validate()?;
+    Ok(response)
+}
+
+/// 从原始字节解析响应。
+pub fn parse_response_bytes(line: &[u8]) -> Result<Response> {
+    let text = std::str::from_utf8(line)
+        .map_err(|_| AppError::protocol(ErrorCode::InvalidUtf8, "response is not valid UTF-8"))?;
+    parse_response_line(text)
+}
+
+/// 把请求编码成 JSON Lines。
+pub fn encode_request_line(request: &Request) -> Result<Vec<u8>> {
+    request.validate()?;
+    encode_json_line(request)
+}
+
+/// 把响应编码成 JSON Lines。
+pub fn encode_response_line(response: &Response) -> Result<Vec<u8>> {
+    response.validate()?;
+    encode_json_line(response)
+}
+
+/// 序列化 JSON，并补上 LF。
+pub fn encode_json_line<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut encoded = serde_json::to_vec(value)?;
+    ensure_frame_size(encoded.len())?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+/// 把终端命令转换成协议请求。
+pub fn parse_command(input: &str) -> Result<Request> {
+    let tokens = tokenize(input.trim())?;
+    let Some(command) = tokens.first().map(String::as_str) else {
+        return Err(AppError::protocol(
+            ErrorCode::MissingArgument,
+            "missing command",
+        ));
+    };
+
+    let request = match command {
+        "set" if tokens.len() == 3 => Request::Set {
+            key: tokens[1].clone(),
+            value: tokens[2].clone(),
+        },
+        "get" if tokens.len() == 2 => Request::Get {
+            key: tokens[1].clone(),
+        },
+        "delete" if tokens.len() == 2 => Request::Delete {
+            key: tokens[1].clone(),
+        },
+        "keys" if tokens.len() == 1 => Request::Keys,
+        "status" if tokens.len() == 1 => Request::Status,
+        "storage-status" | "storage_status" if tokens.len() == 1 => Request::StorageStatus,
+        "compact" if tokens.len() == 1 => Request::Compact,
+        "ping" if tokens.len() == 1 => Request::Ping,
+        "quit" if tokens.len() == 1 => Request::Quit,
+        "set" | "get" | "delete" | "keys" | "status" | "storage-status" | "storage_status"
+        | "compact" | "ping" | "quit" => {
+            let expected = match command {
+                "set" => 3,
+                "get" | "delete" => 2,
+                _ => 1,
+            };
+            let code = if tokens.len() < expected {
+                ErrorCode::MissingArgument
+            } else {
+                ErrorCode::ExtraArgument
+            };
+            return Err(AppError::protocol(code, "wrong number of arguments"));
+        }
+        _ => {
+            return Err(AppError::protocol(
+                ErrorCode::UnknownCommand,
+                format!("unknown command: {command}"),
+            ));
+        }
+    };
+
+    request.validate()?;
+    Ok(request)
+}
+
+fn checked_payload<'a>(line: &'a str, frame_name: &str) -> Result<&'a str> {
+    if !line.ends_with('\n') {
+        return Err(AppError::protocol(
+            ErrorCode::InvalidRequest,
+            format!("{frame_name} frame must end with LF"),
+        ));
+    }
+
+    let without_lf = &line[..line.len() - 1];
+    let payload = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+    ensure_frame_size(payload.len())?;
+    if payload.is_empty() {
+        return Err(AppError::protocol(
+            ErrorCode::InvalidRequest,
+            format!("{frame_name} frame is empty"),
+        ));
+    }
+    Ok(payload)
+}
+
+fn decode_json(payload: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(payload).map_err(|error| {
+        AppError::protocol(ErrorCode::InvalidJson, format!("invalid JSON: {error}"))
+    })
+}
+
+fn ensure_frame_size(payload_bytes: usize) -> Result<()> {
+    if payload_bytes > MAX_FRAME_BYTES {
+        Err(AppError::protocol(
+            ErrorCode::FrameTooLarge,
+            format!("frame exceeds {MAX_FRAME_BYTES} bytes"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_request_fields(value: &serde_json::Value) -> Result<()> {
+    let object = value.as_object().ok_or_else(|| {
+        AppError::protocol(ErrorCode::InvalidRequest, "request must be a JSON object")
+    })?;
+    let command = object
+        .get("cmd")
+        .ok_or_else(|| AppError::protocol(ErrorCode::MissingArgument, "missing cmd field"))?
+        .as_str()
+        .ok_or_else(|| {
+            AppError::protocol(ErrorCode::InvalidRequest, "request cmd must be a string")
+        })?;
+
+    let allowed = match command {
+        "set" => &["cmd", "key", "value"][..],
+        "get" | "delete" => &["cmd", "key"][..],
+        "keys" | "status" | "storage_status" | "compact" | "ping" | "quit" => &["cmd"][..],
+        _ => {
+            return Err(AppError::protocol(
+                ErrorCode::UnknownCommand,
+                format!("unknown command: {command}"),
+            ));
+        }
+    };
+
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(AppError::protocol(
+            ErrorCode::ExtraArgument,
+            format!("unknown request field: {field}"),
+        ));
+    }
+
+    match command {
+        "set" => {
+            required_string(object, "key", ErrorCode::InvalidKey)?;
+            required_string(object, "value", ErrorCode::InvalidValue)?;
+        }
+        "get" | "delete" => {
+            required_string(object, "key", ErrorCode::InvalidKey)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn required_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    invalid_code: ErrorCode,
+) -> Result<&'a str> {
+    object
+        .get(field)
+        .ok_or_else(|| {
+            AppError::protocol(ErrorCode::MissingArgument, format!("missing {field} field"))
+        })?
+        .as_str()
+        .ok_or_else(|| AppError::protocol(invalid_code, format!("{field} must be a string")))
+}
+
+fn invalid_response(message: impl Into<String>) -> AppError {
+    AppError::protocol(ErrorCode::InvalidRequest, message)
+}
+
+fn tokenize(input: &str) -> Result<Vec<String>> {
+    let mut chars = input.chars().peekable();
+    let mut tokens = Vec::new();
+
+    while chars.peek().is_some() {
+        while chars.peek().is_some_and(|ch| ch.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+
+        let mut token = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            let mut closed = false;
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '"' => {
+                        closed = true;
+                        break;
+                    }
+                    '\\' => match chars.next() {
+                        Some('"') => token.push('"'),
+                        Some('\\') => token.push('\\'),
+                        Some(other) => {
+                            return Err(AppError::protocol(
+                                ErrorCode::InvalidRequest,
+                                format!("unsupported escape: \\{other}"),
+                            ));
+                        }
+                        None => {
+                            return Err(AppError::protocol(
+                                ErrorCode::InvalidRequest,
+                                "unfinished escape in quoted argument",
+                            ));
+                        }
+                    },
+                    other => token.push(other),
+                }
+            }
+            if !closed {
+                return Err(AppError::protocol(
+                    ErrorCode::InvalidRequest,
+                    "unterminated quoted argument",
+                ));
+            }
+            if chars.peek().is_some_and(|ch| !ch.is_whitespace()) {
+                return Err(AppError::protocol(
+                    ErrorCode::InvalidRequest,
+                    "quoted argument must be followed by whitespace",
+                ));
+            }
+        } else {
+            while chars.peek().is_some_and(|ch| !ch.is_whitespace()) {
+                let ch = chars.next().expect("peek confirmed a character");
+                if ch == '"' {
+                    return Err(AppError::protocol(
+                        ErrorCode::InvalidRequest,
+                        "quote must start an argument",
+                    ));
+                }
+                token.push(ch);
+            }
+        }
+        tokens.push(token);
+    }
+    Ok(tokens)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufReader, Cursor};
+
     use super::*;
 
     #[test]
-    fn request_serializes_to_the_frozen_command_shape() {
-        let set = Request::Set {
+    fn frame_reader_handles_sticky_and_crlf_frames() {
+        let input = b"{\"cmd\":\"ping\"}\r\n{\"cmd\":\"quit\"}\n";
+        let mut reader = BufReader::new(Cursor::new(input));
+
+        assert!(matches!(read_frame(&mut reader).unwrap(), Frame::Line(_)));
+        assert!(matches!(read_frame(&mut reader).unwrap(), Frame::Line(_)));
+        assert_eq!(read_frame(&mut reader).unwrap(), Frame::Eof);
+    }
+
+    #[test]
+    fn oversized_frame_is_discarded_at_its_line_boundary() {
+        let mut input = vec![b'x'; MAX_FRAME_BYTES + 1];
+        input.extend_from_slice(b"\n{\"cmd\":\"ping\"}\n");
+        let mut reader = BufReader::new(Cursor::new(input));
+
+        assert_eq!(read_frame(&mut reader).unwrap(), Frame::TooLarge);
+        assert!(matches!(read_frame(&mut reader).unwrap(), Frame::Line(_)));
+    }
+
+    #[test]
+    fn oversized_unterminated_frame_is_reported_at_eof() {
+        let input = vec![b'x'; MAX_FRAME_BYTES + 1];
+        let mut reader = BufReader::new(Cursor::new(input));
+
+        assert_eq!(read_frame(&mut reader).unwrap(), Frame::TooLarge);
+    }
+
+    #[test]
+    fn request_and_response_keep_the_frozen_json_shape() {
+        let request = Request::Set {
             key: "name".to_owned(),
             value: "Alice".to_owned(),
         };
         assert_eq!(
-            serde_json::to_string(&set).expect("request serializes"),
-            r#"{"cmd":"set","key":"name","value":"Alice"}"#
+            String::from_utf8(encode_request_line(&request).unwrap()).unwrap(),
+            "{\"cmd\":\"set\",\"key\":\"name\",\"value\":\"Alice\"}\n"
+        );
+
+        let response = Response::success(ResponseData::Set { replaced: false });
+        assert_eq!(
+            String::from_utf8(encode_response_line(&response).unwrap()).unwrap(),
+            "{\"ok\":true,\"data\":{\"kind\":\"set\",\"replaced\":false}}\n"
+        );
+
+        assert_eq!(
+            String::from_utf8(encode_request_line(&Request::StorageStatus).unwrap()).unwrap(),
+            "{\"cmd\":\"storage_status\"}\n"
         );
         assert_eq!(
-            serde_json::to_string(&Request::Keys).expect("request serializes"),
-            r#"{"cmd":"keys"}"#
+            parse_request_line("{\"cmd\":\"compact\"}\n").unwrap(),
+            Request::Compact
         );
     }
 
     #[test]
-    fn response_serializes_to_the_frozen_success_and_failure_shapes() {
-        let success = Response::success(ResponseData::Set { replaced: false });
+    fn quoted_cli_value_preserves_spaces() {
         assert_eq!(
-            serde_json::to_string(&success).expect("response serializes"),
-            r#"{"ok":true,"data":{"kind":"set","replaced":false}}"#
+            parse_command("set course \"Rust systems programming\"").unwrap(),
+            Request::Set {
+                key: "course".to_owned(),
+                value: "Rust systems programming".to_owned(),
+            }
         );
+        assert_eq!(
+            parse_command("storage-status").unwrap(),
+            Request::StorageStatus
+        );
+        assert_eq!(parse_command("compact").unwrap(), Request::Compact);
+    }
 
-        let failure = Response::error(ErrorCode::NotFound, "missing key");
-        assert_eq!(
-            serde_json::to_string(&failure).expect("response serializes"),
-            r#"{"ok":false,"error":{"code":"NOT_FOUND","message":"missing key"}}"#
-        );
+    #[test]
+    fn unknown_fields_and_commands_have_stable_codes() {
+        let extra = parse_request_line("{\"cmd\":\"ping\",\"x\":1}\n").unwrap_err();
+        assert_eq!(extra.code(), ErrorCode::ExtraArgument);
+
+        let unknown = parse_request_line("{\"cmd\":\"drop\"}\n").unwrap_err();
+        assert_eq!(unknown.code(), ErrorCode::UnknownCommand);
     }
 }

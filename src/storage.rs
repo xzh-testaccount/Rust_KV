@@ -114,6 +114,14 @@ impl Store {
     pub(crate) fn delete_validated(&mut self, key: &str) -> Option<String> {
         self.entries.remove(key)
     }
+
+    /// 生成快照时按键顺序复制当前数据。
+    pub(crate) fn snapshot_entries(&self) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
 }
 
 /// 校验键，供后续WAL恢复复用。

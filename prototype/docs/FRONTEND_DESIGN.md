@@ -11,8 +11,8 @@ RustKV Lab 是 Rust 网络 KV 存储的可视化实验台，当前单页应用�
 | 系统总览 | `Overview` | 服务状态、实验进度、最近操作 |
 | 键值操作 | `KV Operations` | `SET`、`GET`、`DELETE`、`KEYS` |
 | 并发实验 | `Concurrency` | 多客户端请求完成情况与正确性判定 |
-| 崩溃恢复 | `Crash Recovery` | Seed、Kill、WAL Replay 与一致性校验 |
-| 性能实验室 | `Performance Lab` | 单次/对照性能实验、图表与动态结论 |
+| 崩溃恢复 | `Crash Recovery` | Seed、Kill、Snapshot + 增量 WAL 恢复与一致性校验 |
+| 性能实验室 | `Performance Lab` | 并发对照、B 模块历史实测对比、实时 Compact 与动态结论 |
 
 页面顶部固定展示品牌、执行模式、服务状态、实验导航和当前键总数。指标条只展示当前键总数，不虚构未有来源的系统指标。
 
@@ -23,9 +23,9 @@ RustKV Lab 是 Rust 网络 KV 存储的可视化实验台，当前单页应用�
 | 模式 | 页面语义 | 数据与请求规则 |
 | --- | --- | --- |
 | 退出答辩模式后的纯前端模式 | 纯前端 UI / 动画测试 | 使用浏览器内存和前端状态机；所有实验数值均为演示流程数据，非实测；不请求后端 |
-| 答辩模式 | 通过适配层连接后端实测 | 经 `lib/rustkv-api.ts` 调用 KV、并发、性能和服务状态接口；结果以接入层响应为准 |
+| 答辩模式 | 通过适配层连接后端实测 | 浏览器请求 `/api/*`，Vite 转发到 `127.0.0.1:7879`；结果只采用控制器响应 |
 
-答辩模式的适配层边界已在界面中定义；本次文档更新只固化界面语义，不进行前后端联调。纯前端模式的标题、状态 pill 和结果文案必须包含“纯前端”“UI/动画测试”或“非实测”等提示；答辩模式必须明确“后端实测”。
+纯前端模式的标题、状态 pill 和结果文案必须包含“纯前端”“UI/动画测试”或“非实测”等提示；答辩模式必须明确“后端实测”。答辩模式请求失败时进入离线、错误或中断状态，不允许降级到本地模拟，也不允许补造业务结果、恢复进度或性能点。
 
 Performance Lab 在答辩模式下，首组准备、`A → B/C` 切换和每次 Retry 前都必须先获得后端 `POST /api/benchmark/reset` 确认，再开始下一组或重试；纯前端模式对应过程仅播放本地动画，不发送该请求。
 
@@ -68,8 +68,8 @@ Performance Lab 在答辩模式下，首组准备、`A → B/C` 切换和每次 
 | 系统总览 | 左侧服务卡，右侧实验进度；最近操作记录横跨底部 |
 | 键值操作 | `310px / minmax(430px, 1fr) / 300px`：命令、存储视图、历史 |
 | 并发实验 | 参数横跨首行；左侧客户端活动矩阵，右侧完成情况与判定 |
-| 崩溃恢复 | 步骤横跨首行；控制、核心校验、WAL Replay 三列 |
-| 性能实验室 | 12 列网格：参数区、预设区、固定条件、执行序列、吞吐图、延迟图、摘要和结论 |
+| 崩溃恢复 | 步骤横跨首行；控制、核心校验、Storage Replay 三列 |
+| 性能实验室 | 12 列网格：参数区、预设区、固定条件、B 模块对比、实时存储状态、执行序列、双图、摘要和结论 |
 
 本次只维护大屏布局，其他视口不在答辩演示范围内。
 
@@ -87,15 +87,15 @@ Performance Lab 在答辩模式下，首组准备、`A → B/C` 切换和每次 
 
 ### 4.3 Crash Recovery：恢复来源与校验来源分离
 
-演示步骤为 `Seed Data + Before → Kill Server → Restart + WAL Replay → Verify`，状态依次经过 `IDLE → PREPARED → CRASHED → RECOVERING → VERIFIED`。
+演示步骤为 `Seed Data + Before → Kill Server → Restart + Snapshot / WAL Replay → Verify`，状态依次经过 `IDLE → PREPARED → CRASHED → RECOVERING → VERIFIED`。
 
 | 证据 | 语义 |
 | --- | --- |
 | `Memory Store` | 易失内存；Kill 后清空，Restart 时由恢复流程重建 |
-| `WAL` | 保留的持久化日志，是唯一恢复来源；按顺序重放 |
-| `Frontend Verification Snapshot` | Seed 后冻结的 Before 基线，只用于 Before/After 校验，绝不作为恢复来源 |
+| 持久化 `Snapshot + WAL` | 真实恢复来源；先加载 Snapshot 最终状态，再按序重放 `lastSequence` 之后的增量 WAL |
+| `Backend Before Evidence` | 控制器在数据可靠写入后返回的 Before 基线，只用于 Before/After 校验，绝不作为恢复来源 |
 
-校验同时比较键数量、抽样值和数据指纹，输出丢失数量与 `CONSISTENCY PASS / FAIL`。验证层故障注入只让 After 校验视图少 2 个键，不改 WAL、Before Snapshot 或真实后端；失败文案应明确“Snapshot 只校验”。
+答辩模式依次调用 `POST /api/recovery/prepare`、`POST /api/recovery/kill`、`POST /api/recovery/restart`，并轮询 `GET /api/recovery/state`。Before/After 数量、指纹、抽样值、丢失数、WAL Replay 数量、恢复耗时、日志和进度全部来自控制器；页面不批量发送 SET、不计算实测指纹、不自增恢复进度，也不自行宣告服务上下线。纯前端模式仍可使用浏览器状态机测试 UI，但必须持续标明“非实测”。
 
 ### 4.4 Performance Lab
 
@@ -109,7 +109,7 @@ Performance Lab 在答辩模式下，首组准备、`A → B/C` 切换和每次 
 | Preset | 对照内容 | 固定条件 |
 | --- | --- | --- |
 | A | `Sync vs Async` | `Mutex`、`Mixed`、全部 Clients 规模 |
-| B | `Mutex vs RwLock` | `Sync`、`Read Heavy`、全部 Clients 规模 |
+| B | `Mutex vs RwLock` | `Async`、`Read Heavy`、全部 Clients 规模 |
 | C | `Read Heavy / Mixed / Write Heavy` | `Async`、`RwLock`、全部 Clients 规模 |
 
 #### Fixed Conditions 与执行序列
@@ -117,6 +117,17 @@ Performance Lab 在答辩模式下，首组准备、`A → B/C` 切换和每次 
 固定条件面板必须展示：`10,000 Keys` 数据集、`128 B` 值大小、每个规模 `10,000 Requests`、`WAL + sync_data`、`JSON Lines`、`Localhost`。持久化条件不可由实验者切换。
 
 Clients 规模可选 `1 → 10 → 50 → 100`，按升序逐点执行。多组答辩演示遵循 `A → 重置相同实验环境 → B/C`：切换对照系列前恢复同一数据集与持久化条件，并在执行序列中计数 `Environment Resets`。
+
+#### B 模块提高项与实时 Compact
+
+Performance Lab 单独保留“基础 WAL vs Snapshot + WAL 压缩”区域，不与并发模型的实时曲线混为同一实验：
+
+- 四张柱状卡片展示持久化文件大小、启动恢复时间、Compact 一次性暂停和 2,000 次正常写入总耗时；
+- 数据固定来自 `2026-09-02` 保存的同负载历史实测，每张卡使用独立数值尺度并显示单位，柱长只能在同一卡片内比较；
+- 历史数据不会随当前后端状态变化，也不标记为本轮实时结果；
+- 答辩模式通过 `GET /api/storage/state` 读取当前引擎、键数、WAL/Snapshot 字节数、WAL 记录数、连续序号和可写状态；
+- 点击“执行真实 Compact”调用 `POST /api/storage/compact`，显示操作前后总大小、WAL 记录数和真实耗时，并再次读取存储状态；
+- 纯前端模式不会构造实时存储统计或 Compact 结果；请求失败只显示错误，不降级为历史数据或模拟数据。
 
 #### 双图、来源与动态结论
 
@@ -143,7 +154,7 @@ Clients 规模可选 `1 → 10 → 50 → 100`，按升序逐点执行。多组�
 ## 6. 修改核对
 
 - 仍是暗色大屏实验台，顶部模式和数据来源清楚可见；
-- Concurrency 只输出正确性结论；Recovery 明确 Memory Store、WAL 与 Snapshot 的职责边界；
-- Performance Lab 保留单次/对照、研究变量、A/B/C Preset、Fixed Conditions、重置序列、双图、来源标识、动态结论、停止保留和失败重试；
+- Concurrency 只输出正确性结论；Recovery 明确 Memory Store、持久化 Snapshot + WAL 与 Before/After 校验证据的职责边界；
+- Performance Lab 保留并发对照、B 模块历史实测、实时存储状态与 Compact、A/B/C Preset、Fixed Conditions、双图、来源标识、动态结论和失败重试；
 - 所有异步、失败、离线和空状态都有文字与下一步提示；
 - 只在本地验证，文档变更后按协作约定执行 `npm run lint` 与 `npm run build`，并如实记录结果。

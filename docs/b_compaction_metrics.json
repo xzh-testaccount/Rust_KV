@@ -1,0 +1,35 @@
+{
+  "generatedAt": "2026-09-02T09:34:02.8106374+08:00",
+  "input": {
+    "operations": 2000,
+    "liveKeys": 100,
+    "outerRuns": 5,
+    "recoveryRepeatsPerRun": 7,
+    "profile": "release",
+    "toolchain": "stable-x86_64-pc-windows-gnu"
+  },
+  "versions": {
+    "basicCommit": "4624d3c",
+    "advancedCommit": "1da03a3",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+  },
+  "medians": {
+    "basicWriteUs": 4847883,
+    "advancedWriteUs": 4631338,
+    "basicDiskBytes": 170000,
+    "advancedDiskBeforeBytes": 238893,
+    "advancedDiskAfterBytes": 4473,
+    "compactUs": 12020,
+    "basicRecoveryUs": 1803,
+    "advancedRecoveryBeforeUs": 3318,
+    "advancedRecoveryAfterUs": 1088
+  },
+  "derivedPercent": {
+    "compactionRatio": 98.12761361781216,
+    "diskReductionVsBasic": 97.36882352941177,
+    "recoveryImprovementVsBasic": 39.6561286744315,
+    "recoveryImprovementBeforeAfter": 67.209162145871,
+    "writeOverhead": -4.4667950938585,
+    "walMetadataOverhead": 40.52529411764705
+  }
+}

@@ -74,7 +74,6 @@ import {
   type ChartConfig,
 } from '@/components/ui/chart';
 import { Input } from '@/components/ui/input';
-import { Switch } from '@/components/ui/switch';
 import {
   LabBadge,
   LabButton,
@@ -90,17 +89,23 @@ import {
 } from '@/components/design_lab';
 import {
   RustKvApiError,
-  killRemoteServer,
+  compactRemoteStorage,
+  killRemoteRecovery,
+  prepareRemoteRecovery,
   readRemoteBenchmark,
   readRemoteConcurrency,
-  readRemoteServerState,
+  readRemoteRecovery,
+  readRemoteStorageState,
   resetRemoteBenchmarkEnvironment,
-  restartRemoteServer,
+  restartRemoteRecovery,
   sendKvCommand,
   startRemoteBenchmark,
   startRemoteConcurrency,
   stopRemoteBenchmark,
   stopRemoteConcurrency,
+  type RemoteRecoveryState,
+  type RemoteStorageCompactResult,
+  type RemoteStorageState,
 } from '@/lib/rustkv-api';
 
 type TabId =
@@ -113,7 +118,7 @@ type TabId =
 type ServerState = 'ONLINE' | 'OFFLINE' | 'STARTING' | 'RECOVERING' | 'ERROR';
 type OperationTone = 'read' | 'write' | 'delete' | 'system' | 'error';
 type ExperimentStatus = 'IDLE' | 'RUNNING' | 'COMPLETED' | 'STOPPED' | 'INTERRUPTED';
-type RecoveryPhase = 'IDLE' | 'PREPARED' | 'CRASHED' | 'RECOVERING' | 'VERIFIED';
+type RecoveryPhase = 'IDLE' | 'PREPARED' | 'CRASHED' | 'RECOVERING' | 'VERIFIED' | 'ERROR';
 type Workload = 'READ_HEAVY' | 'MIXED' | 'WRITE_HEAVY';
 type RuntimeModel = 'Sync' | 'Async';
 type LockStrategy = 'Mutex' | 'RwLock';
@@ -179,6 +184,66 @@ const INITIAL_KEY_COUNT = 327;
 const BENCHMARK_REQUESTS = 10_000;
 const BENCHMARK_SCALES = [1, 10, 50, 100] as const;
 
+type StorageHistoryBar = {
+  id: 'basic' | 'advanced-before' | 'advanced-after';
+  label: string;
+  value: number | null;
+  display: string;
+};
+
+type StorageHistoryMetric = {
+  id: string;
+  label: string;
+  scale: string;
+  note: string;
+  bars: StorageHistoryBar[];
+};
+
+const STORAGE_HISTORY_METRICS: StorageHistoryMetric[] = [
+  {
+    id: 'disk',
+    label: '持久化文件大小',
+    scale: '独立尺度：0–233.3 KiB，越小越好',
+    note: 'Snapshot 发布并清理旧 WAL 后，空间较压缩前减少 98.1%。',
+    bars: [
+      { id: 'basic', label: '基础 WAL', value: 166, display: '166.0 KiB' },
+      { id: 'advanced-before', label: '创新版压缩前', value: 233.3, display: '233.3 KiB' },
+      { id: 'advanced-after', label: 'Snapshot + 压缩后', value: 4.4, display: '4.4 KiB' },
+    ],
+  },
+  {
+    id: 'recovery',
+    label: '启动恢复时间',
+    scale: '独立尺度：0–3.3 ms，越小越好',
+    note: '压缩后先加载最终状态快照，再重放少量增量 WAL。',
+    bars: [
+      { id: 'basic', label: '基础 WAL', value: 1.8, display: '1.8 ms' },
+      { id: 'advanced-before', label: '创新版压缩前', value: 3.3, display: '3.3 ms' },
+      { id: 'advanced-after', label: 'Snapshot + 压缩后', value: 1.1, display: '1.1 ms' },
+    ],
+  },
+  {
+    id: 'compact',
+    label: 'Compact 一次性暂停',
+    scale: '独立尺度：0–12.0 ms，展示操作成本',
+    note: '基础版没有 Compact；创新版以一次短暂停换取后续空间与恢复收益。',
+    bars: [
+      { id: 'basic', label: '基础 WAL', value: null, display: '不支持' },
+      { id: 'advanced-after', label: 'Snapshot + WAL 压缩', value: 12, display: '12.0 ms' },
+    ],
+  },
+  {
+    id: 'writes',
+    label: '2,000 次正常写入',
+    scale: '独立尺度：0–4,847.9 ms，越小越好',
+    note: '两次结果接近；小幅差异只作实测记录，不宣称写入性能必然提升。',
+    bars: [
+      { id: 'basic', label: '基础 WAL', value: 4847.9, display: '4,847.9 ms' },
+      { id: 'advanced-after', label: '创新版', value: 4631.3, display: '4,631.3 ms' },
+    ],
+  },
+];
+
 const workloadMeta: Record<Workload, { label: string; ratio: string; short: string }> = {
   READ_HEAVY: { label: 'Read Heavy', ratio: '90R / 10W', short: '读多写少' },
   MIXED: { label: 'Mixed', ratio: '50R / 50W', short: '均衡读写' },
@@ -238,6 +303,12 @@ function formatClock() {
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat('zh-CN').format(Math.max(0, Math.round(value)));
+}
+
+function formatBytes(value: number) {
+  if (value < 1024) return `${formatNumber(value)} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / 1024 / 1024).toFixed(2)} MiB`;
 }
 
 const textEncoder = new TextEncoder();
@@ -421,7 +492,7 @@ function Overview({
       <LabPanel className={`server-card ${online ? '' : 'offline-panel'}`}>
         <div className="panel-kicker"><Server size={15} /> 服务节点</div>
         <div className={`server-state state-${serverState.toLowerCase()}`}><LabStatusOrb offline={!online} /> {serverLabels[serverState].label}</div>
-        <p className="muted">{backendMode ? '目标地址 127.0.0.1:7878 · 答辩模式请求接入层' : '纯前端 UI / 动画测试 · 不连接后端'}</p>
+        <p className="muted">{backendMode ? '控制器 127.0.0.1:7879 → RustKV 127.0.0.1:7878' : '纯前端 UI / 动画测试 · 不连接后端'}</p>
         <div className="frontend-scope">
           <div><span>运行模式</span><strong>{backendMode ? '答辩模式 · 后端实测' : '纯前端模式 · UI 测试'}</strong></div>
           <div><span>状态来源</span><strong>{backendMode ? '接入层接口响应' : '前端本地状态机'}</strong></div>
@@ -437,7 +508,7 @@ function Overview({
         <LabPanelHeader icon={<Boxes size={15} />} eyebrow="答辩流程" title="四步实验进度" action={<span className="prototype-label">{backendMode ? '后端实测模式' : '纯前端 UI 测试'}</span>} />
         <div className="experiment-list">
           <div><span className="experiment-icon cyan"><Network size={17} /></span><p><strong>多客户端并发</strong><small>只验证完成数、成功数与失败数</small></p><b>{concurrencyStatus === 'COMPLETED' ? (concurrencyFailed ? 'FAIL' : 'PASS') : '—'} <small>正确性</small></b><em>{concurrencyStatus === 'RUNNING' ? '运行中' : concurrencyStatus === 'COMPLETED' ? '已校验' : concurrencyStatus === 'STOPPED' || concurrencyStatus === 'INTERRUPTED' ? '未完成' : '待运行'}</em></div>
-          <div><span className="experiment-icon green"><ShieldCheck size={17} /></span><p><strong>崩溃恢复</strong><small>WAL 恢复 · Snapshot 只负责校验</small></p><b>{recoveryPhase === 'VERIFIED' ? recoveryLost : '—'} <small>丢失键</small></b><em>{recoveryPhase === 'VERIFIED' ? (recoveryLost > 0 ? 'CONSISTENCY FAIL' : 'CONSISTENCY PASS') : '待运行'}</em></div>
+          <div><span className="experiment-icon green"><ShieldCheck size={17} /></span><p><strong>崩溃恢复</strong><small>持久化 Snapshot + 增量 WAL</small></p><b>{recoveryPhase === 'VERIFIED' ? recoveryLost : '—'} <small>丢失键</small></b><em>{recoveryPhase === 'VERIFIED' ? (recoveryLost > 0 ? 'CONSISTENCY FAIL' : 'CONSISTENCY PASS') : '待运行'}</em></div>
           <div><span className="experiment-icon violet"><Gauge size={17} /></span><p><strong>性能实验室</strong><small>控制变量 · 自动多规模 / A/B</small></p><b>{benchmarkPointCount || '—'} <small>已收集点</small></b><em>{benchmarkStatus === 'RUNNING' ? '运行中' : benchmarkStatus === 'COMPLETED' ? '已完成' : benchmarkStatus === 'INTERRUPTED' ? '可重试' : '待运行'}</em></div>
         </div>
       </LabPanel>
@@ -457,11 +528,13 @@ function Overview({
 }
 
 function KvOperations({
+  backendMode,
   online,
   entries,
   operations,
   onAction,
 }: {
+  backendMode: boolean;
   online: boolean;
   entries: KvEntry[];
   operations: OperationLog[];
@@ -491,8 +564,8 @@ function KvOperations({
   const visibleEntries = filteredEntries.slice(safePage * pageSize, (safePage + 1) * pageSize);
   const visibleResult = online ? result : {
     kind: 'error' as const,
-    title: '本地服务状态为离线',
-    message: '请先在“崩溃恢复”页面执行模拟重启，再继续键值操作。',
+    title: backendMode ? '后端不可达' : '本地测试状态为离线',
+    message: backendMode ? '请确认本地控制器与 RustKV Server 已启动，再重新连接。' : '请先在“崩溃恢复”页面执行模拟重启。',
   };
 
   const execute = async (action: KvAction) => {
@@ -530,7 +603,7 @@ function KvOperations({
           <span>{visibleResult.kind === 'success' ? <CheckCircle2 /> : visibleResult.kind === 'error' ? <CircleAlert /> : <TerminalSquare />}</span>
           <div><small>最近结果</small><strong>{visibleResult.title}</strong><p>{visibleResult.message}</p></div>
         </div>
-        <div className="protocol-note secondary-detail"><code>{'>'} LOCAL STATE</code><span>本页只更新浏览器内存，不发送 TCP 或 HTTP 请求。</span></div>
+        <div className="protocol-note secondary-detail"><code>{'>'} {backendMode ? 'POST /api/kv' : 'LOCAL STATE'}</code><span>{backendMode ? '答辩模式只在控制器返回成功后更新页面，不会降级为模拟结果。' : '本页只更新浏览器内存，不发送 TCP 或 HTTP 请求。'}</span></div>
       </LabPanel>
 
       <LabPanel className="store-panel">
@@ -545,7 +618,7 @@ function KvOperations({
                 <button key={entry.key} type="button" className="key-cell" onClick={() => selectEntry(entry)}>
                   <span><Database /><code>{entry.key}</code></span>
                   <strong>{entry.value}</strong>
-                  <small>永久保存</small>
+                  <small>{backendMode ? 'RustKV 后端数据' : '仅浏览器内存 · 非实测'}</small>
                 </button>
             ))}
           </div>
@@ -560,7 +633,7 @@ function KvOperations({
         <div className="history-list">
           {operations.length ? operations.slice(0, 8).map((row) => (
             <div key={row.id}><span className={`history-op ${row.tone}`}>{row.op}</span><p><code>{row.detail}</code><small>{row.result} · {row.latency}</small></p><time>{row.time.slice(0, 8)}</time></div>
-          )) : <div className="empty-log">暂无本地操作记录。</div>}
+          )) : <div className="empty-log">暂无{backendMode ? '后端请求' : '本地'}操作记录。</div>}
         </div>
       </LabPanel>
     </section>
@@ -624,13 +697,13 @@ function ConcurrencyPage({
         <div className={`client-grid ${running ? 'is-running' : ''}`} style={{ gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))` }}>
           {renderedClients.map((index) => {
             const phase = (index + Math.floor(progress / 3)) % 7;
-            const tone = !running && status !== 'COMPLETED' ? 'idle' : phase < 3 ? 'read' : phase < 6 ? 'write' : 'delete';
-            return <div key={index} className={`client-node ${tone}`} title={`客户端 ${index + 1}`}><span>C{index + 1}</span><i /></div>;
+            const tone = backendMode || !running && status !== 'COMPLETED' ? 'idle' : phase < 3 ? 'read' : phase < 6 ? 'write' : 'delete';
+            return <div key={index} className={`client-node ${tone}`} title={backendMode ? `客户端 ${index + 1} · 页面不伪造单客户端轨迹` : `虚拟客户端 ${index + 1}`}><span>C{index + 1}</span><i /></div>;
           })}
         </div>
         <div className="sample-stream secondary-detail">
-          <span>请求采样</span>
-          <code>Client {Math.max(1, Math.min(clients, Math.floor(progress / 2) + 1))} → {workload === 'WRITE_HEAVY' ? 'SET' : progress % 3 === 0 ? 'GET' : 'SET'} lab:key:{Math.floor(progress * 1.7)} → SUCCESS</code>
+          <span>{backendMode ? '控制器聚合状态' : '请求采样 · 非实测'}</span>
+          <code>{backendMode ? `${status} · Completed ${formatNumber(currentCompleted)} · Success ${formatNumber(successful)} · Failed ${formatNumber(failed)}` : `Virtual Client ${Math.max(1, Math.min(clients, Math.floor(progress / 2) + 1))} → ${workload === 'WRITE_HEAVY' ? 'SET' : progress % 3 === 0 ? 'GET' : 'SET'} demo:key:${Math.floor(progress * 1.7)} → UI SAMPLE`}</code>
         </div>
       </LabPanel>
 
@@ -654,8 +727,8 @@ function RecoveryPage({
   phase,
   seedCount,
   setSeedCount,
-  injectFailure,
-  setInjectFailure,
+  actionPending,
+  verifiedBySource,
   beforeCount,
   recoveredCount,
   recoveryLost,
@@ -677,8 +750,8 @@ function RecoveryPage({
   phase: RecoveryPhase;
   seedCount: number;
   setSeedCount: (value: number) => void;
-  injectFailure: boolean;
-  setInjectFailure: (value: boolean) => void;
+  actionPending: 'prepare' | 'kill' | 'restart' | null;
+  verifiedBySource: boolean;
   beforeCount: number;
   recoveredCount: number;
   recoveryLost: number;
@@ -695,14 +768,21 @@ function RecoveryPage({
   onKill: () => void;
   onRestart: () => void;
 }) {
-  const phaseIndex = phase === 'IDLE' ? 0 : phase === 'PREPARED' ? 1 : phase === 'CRASHED' ? 2 : phase === 'RECOVERING' ? 3 : 4;
+  const phaseIndex = phase === 'IDLE' || phase === 'ERROR' ? 0 : phase === 'PREPARED' ? 1 : phase === 'CRASHED' ? 2 : phase === 'RECOVERING' ? 3 : 4;
   const verified = phase === 'VERIFIED';
   const samplesMatch = sampleBefore.every((sample) => verificationEntries.find((entry) => entry.key === sample.key)?.value === sample.value);
-  const pass = verified && beforeCount > 0 && recoveredCount === beforeCount && verificationEntries.length === beforeCount && recoveryLost === 0 && beforeFingerprint === afterFingerprint && samplesMatch;
+  const pass = verified && verifiedBySource && beforeCount > 0 && recoveredCount === beforeCount && recoveryLost === 0 && beforeFingerprint === afterFingerprint && samplesMatch;
   const offline = serverState === 'OFFLINE';
   const steps = ['准备数据', '强制断电', '重启服务', 'WAL 重放', '自动校验'];
   const beforeDisplay: number | string = beforeCount || '—';
   const afterDisplay = verified ? recoveredCount : phase === 'RECOVERING' ? recoveredCount : phase === 'CRASHED' ? 0 : '—';
+  const memoryCount = offline
+    ? 0
+    : phase === 'RECOVERING' || verified
+      ? recoveredCount
+      : backendMode && phase === 'PREPARED'
+        ? beforeCount
+        : currentEntries.length;
 
   return (
     <section className={`recovery-page lab-page ${offline ? 'power-cut-mode' : ''}`}>
@@ -712,27 +792,26 @@ function RecoveryPage({
 
       <LabPanel className="recovery-control">
         <LabPanelHeader icon={<ShieldAlert size={15} />} eyebrow={`断电实验控制 · ${backendMode ? '后端进程' : '纯前端动画'}`} title="Seed → Kill → Restart → Verify" action={<LabStatusPill tone={serverState === 'ONLINE' ? 'online' : serverState === 'OFFLINE' ? 'offline' : 'warning'}>{serverLabels[serverState].label}</LabStatusPill>} />
-        <div className="seed-presets"><span>准备演示数据</span><div>{[50, 100, 500, 1000].map((value) => <button key={value} className={seedCount === value ? 'active' : ''} disabled={serverState !== 'ONLINE' || phase === 'RECOVERING'} onClick={() => setSeedCount(value)}>{value} 键</button>)}</div></div>
-        <div className="failure-toggle"><div><strong>验证层故障注入</strong><small>只让 After 校验视图少 2 个键；不修改 WAL、Before Snapshot 或真实后端</small></div><Switch aria-label="验证层故障注入" checked={injectFailure} onCheckedChange={setInjectFailure} disabled={phase === 'RECOVERING' || phase === 'CRASHED'} /></div>
+        <div className="seed-presets"><span>准备演示数据</span><div>{[50, 100, 500, 1000].map((value) => <button key={value} className={seedCount === value ? 'active' : ''} disabled={serverState !== 'ONLINE' || phase === 'RECOVERING' || actionPending !== null} onClick={() => setSeedCount(value)}>{value} 键</button>)}</div></div>
         <div className="recovery-actions">
-          <LabButton variant="secondary" disabled={serverState !== 'ONLINE' || phase === 'RECOVERING'} onClick={onSeed}><Database /> ① Seed Data + Before</LabButton>
-          <LabButton variant="destructive" className="kill-button" disabled={phase !== 'PREPARED' || serverState !== 'ONLINE'} onClick={onKill}><Zap /> ② Kill Server</LabButton>
-          <LabButton className="restart-button" disabled={phase !== 'CRASHED'} onClick={onRestart}><RefreshCcw /> ③ Restart + WAL Replay</LabButton>
+          <LabButton variant="secondary" disabled={serverState !== 'ONLINE' || phase === 'RECOVERING' || actionPending !== null} onClick={onSeed}><Database /> {actionPending === 'prepare' ? '正在准备真实证据…' : '① Seed Data + Before'}</LabButton>
+          <LabButton variant="destructive" className="kill-button" disabled={phase !== 'PREPARED' || serverState !== 'ONLINE' || actionPending !== null} onClick={onKill}><Zap /> {actionPending === 'kill' ? '正在强制终止…' : '② Kill Server'}</LabButton>
+          <LabButton className="restart-button" disabled={phase !== 'CRASHED' || actionPending !== null} onClick={onRestart}><RefreshCcw /> {actionPending === 'restart' ? '正在启动恢复…' : '③ Restart + Snapshot / WAL'}</LabButton>
         </div>
         <div className="recovery-evidence">
-          <div className={serverState === 'OFFLINE' ? 'lost' : ''}><HardDrive /><span>Memory Store</span><strong>{serverState === 'OFFLINE' ? 0 : phase === 'RECOVERING' ? recoveredCount : currentEntries.length} Keys</strong><small>易失 · Kill 后清空</small></div>
-          <div className="wal-source"><FileClock /><span>WAL</span><strong>{phase === 'IDLE' ? '等待 Seed' : 'Preserved'}</strong><small>唯一恢复来源</small></div>
-          <div className="verify-only"><ListChecks /><span>Frontend Snapshot</span><strong>{beforeCount || '—'} Keys</strong><small>只用于 Before / After 校验</small></div>
+          <div className={serverState === 'OFFLINE' ? 'lost' : ''}><HardDrive /><span>Memory Store</span><strong>{memoryCount} Keys</strong><small>易失 · Kill 后清空</small></div>
+          <div className="wal-source"><FileClock /><span>Snapshot + WAL</span><strong>{phase === 'IDLE' ? '等待 Seed' : phase === 'ERROR' ? '状态未知' : 'Preserved'}</strong><small>真实恢复来源 · 快照后重放增量</small></div>
+          <div className="verify-only"><ListChecks /><span>{backendMode ? 'Backend Before Evidence' : 'Frontend Snapshot'}</span><strong>{beforeCount || '—'} Keys</strong><small>{backendMode ? '控制器返回，仅用于校验' : '只用于 Before / After 校验'}</small></div>
         </div>
       </LabPanel>
 
       <LabPanel className={`recovery-proof ${verified ? (pass ? 'proof-pass' : 'proof-fail') : ''}`}>
-        <LabPanelHeader icon={<ShieldCheck size={15} />} eyebrow="自动一致性校验" title="WAL 重建的 Memory 是否等于 Before？" action={verified ? <LabBadge variant="proof" tone={pass ? 'pass' : 'fail'}>{pass ? 'CONSISTENCY PASS' : 'CONSISTENCY FAIL'}</LabBadge> : <LabBadge variant="proof" tone="waiting">等待实验</LabBadge>} />
+        <LabPanelHeader icon={<ShieldCheck size={15} />} eyebrow="自动一致性校验" title="持久化数据重建的 Memory 是否等于 Before？" action={verified ? <LabBadge variant="proof" tone={pass ? 'pass' : 'fail'}>{pass ? 'CONSISTENCY PASS' : 'CONSISTENCY FAIL'}</LabBadge> : <LabBadge variant="proof" tone="waiting">等待实验</LabBadge>} />
         <div className="recovery-metrics">
-          <div><span>Before Keys</span><strong>{typeof beforeDisplay === 'number' ? formatNumber(beforeDisplay) : beforeDisplay}</strong><small>Frontend Snapshot</small></div>
+          <div><span>Before Keys</span><strong>{typeof beforeDisplay === 'number' ? formatNumber(beforeDisplay) : beforeDisplay}</strong><small>{backendMode ? 'Controller Evidence' : 'Frontend Snapshot'}</small></div>
           <div><span>Recovered Keys</span><strong>{typeof afterDisplay === 'number' ? formatNumber(afterDisplay) : afterDisplay}</strong><small>Memory Store</small></div>
           <div className={verified && recoveryLost ? 'danger' : ''}><span>Lost Keys</span><strong>{verified ? recoveryLost : '—'}</strong><small>Before − After</small></div>
-          <div><span>WAL Replay</span><strong>{walReplayCount === null ? '—' : formatNumber(walReplayCount)}</strong><small>{walReplayCount === null ? '等待接入层返回' : 'Records'}</small></div>
+          <div><span>增量 WAL Replay</span><strong>{walReplayCount === null ? '—' : formatNumber(walReplayCount)}</strong><small>{walReplayCount === null ? '等待接入层返回' : 'Records'}</small></div>
           <div><span>Recovery Time</span><strong>{recoveryTime ? recoveryTime.toFixed(2) : '—'}</strong><small>Seconds</small></div>
         </div>
         <div className="hash-compare">
@@ -747,20 +826,173 @@ function RecoveryPage({
         </div>
         <div className={`big-verdict ${verified ? (pass ? 'pass' : 'fail') : 'waiting'}`}>
           {verified ? (pass ? <CheckCircle2 /> : <CircleAlert />) : <ShieldCheck />}
-          <div><strong>{verified ? (pass ? 'CONSISTENCY PASS' : 'CONSISTENCY FAIL') : '等待 Restart 后自动比对'}</strong><span>{verified ? (pass ? `${formatNumber(beforeCount)} 个键由 WAL 重建，数量、抽样值与 Hash 一致。` : `发现 ${recoveryLost} 个键丢失；Before Snapshot 只负责发现差异，从未参与恢复。`) : '恢复来源始终是 WAL；Frontend Verification Snapshot 只提供校验基线。'}</span></div>
+          <div><strong>{verified ? (pass ? 'CONSISTENCY PASS' : 'CONSISTENCY FAIL') : phase === 'ERROR' ? 'RECOVERY ERROR' : '等待 Restart 后自动比对'}</strong><span>{verified ? (pass ? `${formatNumber(beforeCount)} 个键由持久化 Snapshot + WAL 重建，数量、抽样值与 Hash 一致。` : `恢复证据未通过一致性校验；Before Evidence 只负责发现差异，从未参与恢复。`) : backendMode ? '恢复来自持久化 Snapshot + 增量 WAL；控制器 Before / After 只负责校验。' : '纯前端只播放 WAL 恢复动画；Frontend Verification Snapshot 只提供校验基线。'}</span></div>
         </div>
       </LabPanel>
 
       <LabPanel className="replay-panel">
-        <LabPanelHeader icon={<TerminalSquare size={15} />} eyebrow={`WAL Replay · ${backendMode ? '恢复过程' : 'UI 动画'}`} title="从 WAL 重建 Memory Store" action={<span className="replay-percent">{Math.round(progress)}%</span>} />
+        <LabPanelHeader icon={<TerminalSquare size={15} />} eyebrow={`Storage Replay · ${backendMode ? '恢复过程' : 'UI 动画'}`} title={backendMode ? '从 Snapshot + 增量 WAL 重建 Memory Store' : '从模拟 WAL 重建 Memory Store'} action={<span className="replay-percent">{Math.round(progress)}%</span>} />
         <LabProgress value={progress} className="replay-progress" />
-        <div className="replay-counter"><span>已恢复</span><strong>{formatNumber(phase === 'RECOVERING' ? recoveredCount : verified ? currentEntries.length : 0)}</strong><small>/ {typeof beforeDisplay === 'number' ? formatNumber(beforeDisplay) : beforeDisplay} 键</small></div>
+        <div className="replay-counter"><span>已恢复</span><strong>{formatNumber(phase === 'RECOVERING' || verified ? recoveredCount : 0)}</strong><small>/ {typeof beforeDisplay === 'number' ? formatNumber(beforeDisplay) : beforeDisplay} 键</small></div>
         <div className="replay-log">
-          {logs.length ? logs.slice(-9).map((log, index) => <code key={`${log}-${index}`}><span>{String(index + 1).padStart(2, '0')}</span>{log}</code>) : <div className="empty-log">运行断电实验后，这里会逐条显示 WAL Replay 过程。</div>}
+          {logs.length ? logs.slice(-9).map((log, index) => <code key={`${log}-${index}`}><span>{String(index + 1).padStart(2, '0')}</span>{log}</code>) : <div className="empty-log">运行断电实验后，这里会显示 Snapshot 加载与增量 WAL Replay 过程。</div>}
         </div>
       </LabPanel>
     </section>
   );
+}
+
+function StorageInnovationPanels({
+  backendMode,
+  online,
+}: {
+  backendMode: boolean;
+  online: boolean;
+}) {
+  const [storageState, setStorageState] = useState<RemoteStorageState | null>(null);
+  const [compactResult, setCompactResult] = useState<RemoteStorageCompactResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [compacting, setCompacting] = useState(false);
+  const [error, setError] = useState('');
+  const requestEpochRef = useRef(0);
+  const visibleStorageState = backendMode && online ? storageState : null;
+  const visibleCompactResult = backendMode ? compactResult : null;
+  const visibleError = backendMode && !online
+    ? '后端当前离线，未提供实时存储数据。'
+    : error;
+
+  const refreshStorage = useCallback(async () => {
+    const requestEpoch = ++requestEpochRef.current;
+    if (!backendMode) {
+      setStorageState(null);
+      setCompactResult(null);
+      setError('');
+      setLoading(false);
+      return;
+    }
+    if (!online) {
+      setStorageState(null);
+      setError('后端当前离线，未提供实时存储数据。');
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+    try {
+      const state = await readRemoteStorageState();
+      if (requestEpoch === requestEpochRef.current) setStorageState(state);
+    } catch (loadError) {
+      if (requestEpoch !== requestEpochRef.current) return;
+      setStorageState(null);
+      setError(loadError instanceof RustKvApiError
+        ? `${loadError.code} · ${loadError.message}`
+        : '实时存储状态读取失败');
+    } finally {
+      if (requestEpoch === requestEpochRef.current) setLoading(false);
+    }
+  }, [backendMode, online]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => void refreshStorage(), 0);
+    return () => {
+      window.clearTimeout(timer);
+      requestEpochRef.current += 1;
+    };
+  }, [refreshStorage]);
+
+  const compactStorage = async () => {
+    if (!backendMode || !online || compacting) return;
+    requestEpochRef.current += 1;
+    setCompacting(true);
+    setError('');
+    try {
+      const result = await compactRemoteStorage();
+      setCompactResult(result);
+      setStorageState(await readRemoteStorageState());
+    } catch (compactError) {
+      setStorageState(null);
+      setError(compactError instanceof RustKvApiError
+        ? `${compactError.code} · ${compactError.message}`
+        : 'Compact 请求失败');
+    } finally {
+      setCompacting(false);
+    }
+  };
+
+  return <>
+    <LabPanel className="storage-history-comparison">
+      <LabPanelHeader
+        icon={<Sparkles size={15} />}
+        eyebrow="B 模块提高项 · 历史实测"
+        title="基础 WAL vs Snapshot + WAL 压缩"
+        action={<span className="experiment-source measured">2026-09-02 · 固定负载历史实测</span>}
+      />
+      <div className="storage-history-legend" aria-label="历史实测系列图例">
+        <span className="basic"><i />基础 WAL</span>
+        <span className="advanced-before"><i />创新版压缩前</span>
+        <span className="advanced-after"><i />Snapshot + 压缩后</span>
+      </div>
+      <div className="storage-history-conditions"><span>2,000 Operations</span><span>100 Live Keys</span><span>5 Runs Median</span><span>Release · Windows GNU</span></div>
+      <div className="storage-history-grid">
+        {STORAGE_HISTORY_METRICS.map((metric) => {
+          const maxValue = Math.max(...metric.bars.map((bar) => bar.value ?? 0), 1);
+          return <article key={metric.id} className="storage-history-metric">
+            <div className="storage-history-title"><strong>{metric.label}</strong><small>{metric.scale}</small></div>
+            <div className="storage-history-bars">
+              {metric.bars.map((bar) => <div key={bar.id} className="storage-history-row">
+                <span>{bar.label}</span>
+                <div className="storage-history-track"><i className={bar.id} style={{ width: bar.value === null ? 0 : `${bar.value / maxValue * 100}%` }} /></div>
+                <b>{bar.display}</b>
+              </div>)}
+            </div>
+            <p>{metric.note}</p>
+          </article>;
+        })}
+      </div>
+      <footer>每张指标卡使用自己的纵向数值范围，柱长只能在同一卡片内比较；该区域展示已保存实验记录，不会随当前服务器状态变化。</footer>
+    </LabPanel>
+
+    <LabPanel className="storage-live-state" aria-live="polite">
+      <LabPanelHeader
+        icon={<HardDrive size={15} />}
+        eyebrow="Current Storage · 实时后端"
+        title="Snapshot / WAL 状态与手动压缩"
+        action={visibleStorageState
+          ? <LabStatusPill tone={visibleStorageState.writable ? 'online' : 'warning'}>{visibleStorageState.writable ? 'WRITABLE' : 'READ ONLY'}</LabStatusPill>
+          : <LabStatusPill tone={visibleError ? 'offline' : 'neutral'}>{loading ? 'LOADING' : backendMode ? 'NO DATA' : 'BACKEND ONLY'}</LabStatusPill>}
+      />
+
+      {visibleStorageState ? <>
+        <div className="storage-engine"><span>Storage Engine</span><strong>{visibleStorageState.engine}</strong></div>
+        <div className="storage-live-grid">
+          <div><span>Entries</span><strong>{formatNumber(visibleStorageState.entries)}</strong></div>
+          <div><span>Last Sequence</span><strong>{formatNumber(visibleStorageState.lastSequence)}</strong></div>
+          <div><span>WAL Records</span><strong>{formatNumber(visibleStorageState.walRecords)}</strong></div>
+          <div><span>WAL Size</span><strong>{formatBytes(visibleStorageState.walBytes)}</strong></div>
+          <div><span>Snapshot Size</span><strong>{formatBytes(visibleStorageState.snapshotBytes)}</strong></div>
+          <div><span>Total Persistent</span><strong>{formatBytes(visibleStorageState.totalBytes)}</strong></div>
+        </div>
+      </> : <div className="storage-live-empty">
+        <HardDrive />
+        <strong>{loading ? '正在读取真实存储状态' : backendMode ? '没有可展示的实时状态' : '进入答辩模式后读取真实后端'}</strong>
+        <p>{backendMode ? visibleError || '等待 /api/storage/state 返回。' : '纯前端模式不会构造 WAL、Snapshot 或 Compact 结果。'}</p>
+      </div>}
+
+      {visibleCompactResult && <div className="compact-result">
+        <span><CheckCircle2 /> 最近一次真实 Compact</span>
+        <div><strong>{formatBytes(visibleCompactResult.before.totalBytes)} → {formatBytes(visibleCompactResult.after.totalBytes)}</strong><b>{visibleCompactResult.compactMs.toFixed(2)} ms</b></div>
+        <small>WAL {formatNumber(visibleCompactResult.before.walRecords)} → {formatNumber(visibleCompactResult.after.walRecords)} Records · {visibleCompactResult.compacted ? 'COMPACTED' : 'NO CHANGE'}</small>
+      </div>}
+
+      {visibleError && visibleStorageState && <p className="storage-live-error"><CircleAlert /> {visibleError}</p>}
+      <div className="storage-live-actions">
+        <LabButton variant="outline" onClick={() => void refreshStorage()} disabled={!backendMode || !online || loading || compacting}><RefreshCcw />刷新状态</LabButton>
+        <LabButton onClick={() => void compactStorage()} disabled={!backendMode || !online || loading || compacting || !visibleStorageState?.writable}>{compacting ? <Activity /> : <HardDrive />}{compacting ? '正在 Compact…' : '执行真实 Compact'}</LabButton>
+      </div>
+      <p className="compact-warning">Compact 会把当前最终状态原子发布为 Snapshot，再清理已覆盖的 WAL；操作期间写入会短暂停顿。</p>
+    </LabPanel>
+  </>;
 }
 
 function PerformancePage({
@@ -940,7 +1172,7 @@ function PerformancePage({
         <LabPanelHeader icon={<Sparkles size={15} />} eyebrow="答辩预设" title="一键装载标准控制变量实验" />
         <div className="preset-cards">
           <button type="button" className={preset === 'A' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('A')}><span>A</span><div><strong>Sync vs Async</strong><small>固定 Mutex · Mixed · 全部 Clients</small></div></button>
-          <button type="button" className={preset === 'B' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('B')}><span>B</span><div><strong>Mutex vs RwLock</strong><small>固定 Sync · Read Heavy · 全部 Clients</small></div></button>
+          <button type="button" className={preset === 'B' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('B')}><span>B</span><div><strong>Mutex vs RwLock</strong><small>固定 Async · Read Heavy · 全部 Clients</small></div></button>
           <button type="button" className={preset === 'C' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('C')}><span>C</span><div><strong>Workload Comparison</strong><small>固定 Async · RwLock · 全部 Clients</small></div></button>
         </div>
         <p>RwLock 的潜在优势主要来自并发读；Write Heavy 下不保证优于 Mutex。</p>
@@ -950,6 +1182,8 @@ function PerformancePage({
         <LabPanelHeader icon={<ListChecks size={15} />} eyebrow="Fixed Conditions" title="所有对照组共享同一实验条件" action={<span className="prototype-label">WAL / sync_data 不可切换</span>} />
         <div><span>Dataset Size</span><strong>10,000 Keys</strong></div><div><span>Value Size</span><strong>128 B</strong></div><div><span>Requests / Scale</span><strong>10,000</strong></div><div><span>Persistence</span><strong>WAL + sync_data</strong></div><div><span>Protocol</span><strong>JSON Lines</strong></div><div><span>Network</span><strong>Localhost</strong></div>
       </LabPanel>
+
+      <StorageInnovationPanels backendMode={backendMode} online={online} />
 
       <LabPanel className="scale-runner" aria-live="polite">
         <LabPanelHeader icon={<Activity size={15} />} eyebrow="执行序列" title={stage || '等待运行实验'} action={<div className="runner-progress"><span>{completedSteps} / {totalSteps || displayedSeries.length * scales.length} Steps</span><strong>{Math.round(progress)}%</strong></div>} />
@@ -1044,7 +1278,8 @@ export default function Home() {
 
   const [recoveryPhase, setRecoveryPhase] = useState<RecoveryPhase>('IDLE');
   const [recoverySeedCount, setRecoverySeedCount] = useState(100);
-  const [injectRecoveryFailure, setInjectRecoveryFailure] = useState(false);
+  const [recoveryActionPending, setRecoveryActionPending] = useState<'prepare' | 'kill' | 'restart' | null>(null);
+  const [recoveryVerified, setRecoveryVerified] = useState(false);
   const [recoveryBeforeCount, setRecoveryBeforeCount] = useState(0);
   const [recoveredCount, setRecoveredCount] = useState(0);
   const [recoveryLost, setRecoveryLost] = useState(0);
@@ -1059,7 +1294,7 @@ export default function Home() {
 
   const [benchmarkMode, setBenchmarkMode] = useState<ExperimentMode>('COMPARE');
   const [benchmarkResearchVariable, setBenchmarkResearchVariable] = useState<ResearchVariable>('LOCK');
-  const [benchmarkRuntime, setBenchmarkRuntime] = useState<RuntimeModel>('Sync');
+  const [benchmarkRuntime, setBenchmarkRuntime] = useState<RuntimeModel>('Async');
   const [benchmarkLock, setBenchmarkLock] = useState<LockStrategy>('Mutex');
   const [benchmarkScales, setBenchmarkScales] = useState<number[]>([...BENCHMARK_SCALES]);
   const [benchmarkWorkload, setBenchmarkWorkload] = useState<Workload>('READ_HEAVY');
@@ -1120,6 +1355,37 @@ export default function Home() {
     return loaded;
   }, []);
 
+  const applyRemoteRecoveryState = useCallback((state: RemoteRecoveryState) => {
+    setRecoveryPhase(state.phase);
+    setRecoveryProgress(state.progress);
+    setRecoveryBeforeCount(state.before?.count ?? 0);
+    setRecoveredCount(state.after?.count ?? 0);
+    setRecoveryLost(state.lost);
+    setRecoveryVerified(state.verified);
+    setBeforeFingerprint(state.before?.fingerprint ?? '');
+    setAfterFingerprint(state.after?.fingerprint ?? '');
+    setRecoverySamples(state.before?.samples ?? []);
+    setRecoveryVerificationEntries(state.after?.samples ?? []);
+    setWalReplayCount(state.walReplayCount);
+    setRecoveryTime(state.recoveryTimeMs / 1000);
+    setRecoveryLogs(state.logs);
+    if (state.phase === 'CRASHED') {
+      setEntries([]);
+      setServerState('OFFLINE');
+    } else if (state.phase === 'RECOVERING') {
+      setServerState('RECOVERING');
+    } else if (state.phase === 'ERROR') {
+      setServerState('ERROR');
+    } else {
+      setServerState('ONLINE');
+    }
+    setLastUpdate(formatClock().slice(0, 8));
+  }, []);
+
+  const appendRecoveryLog = useCallback((message: string) => {
+    setRecoveryLogs((previous) => [...previous, message]);
+  }, []);
+
   useEffect(() => () => {
     clearTimer(concurrencyTimerRef);
     clearTimer(recoveryTimerRef);
@@ -1142,22 +1408,21 @@ export default function Home() {
         const response = await sendKvCommand({ cmd: 'ping' });
         if (response.kind !== 'ping') throw new RustKvApiError('INVALID_RESPONSE', 'ping 响应类型不匹配');
         if (cancelled || epoch !== lifecycleEpochRef.current || suspendHealthProbeRef.current) return;
-        backendFailureCountRef.current = 0;
-        setServerState('ONLINE');
-        setLastUpdate('刚刚');
-        if (!loadedInitialStore) {
+        const shouldReloadStore = !loadedInitialStore || backendFailureCountRef.current > 0;
+        if (shouldReloadStore) {
           const loaded = await refreshBackendEntries();
           if (cancelled || epoch !== lifecycleEpochRef.current || suspendHealthProbeRef.current) return;
           setEntries(loaded);
           loadedInitialStore = true;
         }
+        backendFailureCountRef.current = 0;
+        setServerState('ONLINE');
+        setLastUpdate('刚刚');
       } catch {
         if (cancelled || epoch !== lifecycleEpochRef.current || suspendHealthProbeRef.current) return;
         backendFailureCountRef.current += 1;
-        if (backendFailureCountRef.current >= 3) {
-          setServerState('OFFLINE');
-          setLastUpdate(formatClock().slice(0, 8));
-        }
+        setServerState('OFFLINE');
+        setLastUpdate(formatClock().slice(0, 8));
       } finally {
         probing = false;
       }
@@ -1200,7 +1465,9 @@ export default function Home() {
           const response = await sendKvCommand({ cmd: 'set', key: normalizedKey, value });
           if (isStale()) return staleResult;
           if (response.kind !== 'set') throw new RustKvApiError('INVALID_RESPONSE', 'set 响应类型不匹配');
-          setEntries((previous) => response.replaced ? previous.map((entry) => entry.key === normalizedKey ? { key: normalizedKey, value } : entry) : [{ key: normalizedKey, value }, ...previous]);
+          setEntries((previous) => previous.some((entry) => entry.key === normalizedKey)
+            ? previous.map((entry) => entry.key === normalizedKey ? { key: normalizedKey, value } : entry)
+            : [{ key: normalizedKey, value }, ...previous]);
           const latency = `${(performance.now() - startedAt).toFixed(1)} ms`;
           addOperation('SET', normalizedKey, 'write', response.replaced ? '后端已更新' : '后端已创建', latency);
           return { kind: 'success', title: response.replaced ? '写入成功 · 已更新' : '写入成功 · 已创建', message: '后端成功响应表示 WAL、flush 与 sync_data 已完成。' };
@@ -1218,6 +1485,7 @@ export default function Home() {
           const response = await sendKvCommand({ cmd: 'delete', key: normalizedKey });
           if (isStale()) return staleResult;
           if (response.kind !== 'delete') throw new RustKvApiError('INVALID_RESPONSE', 'delete 响应类型不匹配');
+          if (!response.deleted) throw new RustKvApiError('NOT_FOUND', `键不存在：${normalizedKey}`);
           setEntries((previous) => previous.filter((entry) => entry.key !== normalizedKey));
           const latency = `${(performance.now() - startedAt).toFixed(1)} ms`;
           addOperation('DEL', normalizedKey, 'delete', '后端已删除', latency);
@@ -1312,14 +1580,14 @@ export default function Home() {
               setConcurrencyStatus(state.status);
               return;
             }
-            if (attempts >= 180) {
+            if (attempts >= 1800) {
               clearTimer(concurrencyTimerRef);
               concurrencyRunningRef.current = false;
               setConcurrencyStatus('INTERRUPTED');
-              addOperation('LOAD', `${concurrencyClients} clients`, 'error', '实验状态轮询超时 · 未判定', '—');
+              addOperation('LOAD', `${concurrencyClients} clients`, 'error', '实验状态轮询超过 15 分钟 · 未判定', '—');
               return;
             }
-            concurrencyTimerRef.current = window.setTimeout(() => void poll(), 320);
+            concurrencyTimerRef.current = window.setTimeout(() => void poll(), 500);
           } catch (error) {
             if (!isActiveRun()) return;
             clearTimer(concurrencyTimerRef);
@@ -1414,38 +1682,46 @@ export default function Home() {
   };
 
   const seedRecoveryData = async () => {
-    if (serverState !== 'ONLINE') return;
+    if (serverState !== 'ONLINE' || recoveryActionPending !== null) return;
     const epoch = lifecycleEpochRef.current;
     const runId = ++recoveryRunRef.current;
     const isActiveRun = () => epoch === lifecycleEpochRef.current && runId === recoveryRunRef.current;
+    if (backendMode) {
+      setRecoveryActionPending('prepare');
+      try {
+        const state = await prepareRemoteRecovery(recoverySeedCount);
+        if (!isActiveRun()) return;
+        if (state.phase !== 'PREPARED' || !state.before) {
+          throw new RustKvApiError('INVALID_RESPONSE', '控制器未返回 PREPARED 与 Before 证据');
+        }
+        applyRemoteRecoveryState(state);
+        try {
+          const loaded = await refreshBackendEntries();
+          if (isActiveRun()) setEntries(loaded);
+        } catch {
+          if (isActiveRun()) setEntries([]);
+        }
+        addOperation('SEED', `${recoverySeedCount} keys`, 'write', '控制器已返回 Before 证据', '实测');
+      } catch (error) {
+        if (!isActiveRun()) return;
+        const apiError = error instanceof RustKvApiError ? error : new RustKvApiError('UNKNOWN', '恢复实验准备失败');
+        setRecoveryVerified(false);
+        setRecoveryPhase('ERROR');
+        setRecoveryLogs([`[CLIENT ERROR] ${apiError.code} · ${apiError.message}`]);
+        setServerState(apiError.code === 'BACKEND_UNREACHABLE' || apiError.code === 'TIMEOUT' ? 'OFFLINE' : 'ERROR');
+        addOperation('SEED', `${recoverySeedCount} keys`, 'error', apiError.code, '—');
+      } finally {
+        if (isActiveRun()) setRecoveryActionPending(null);
+      }
+      return;
+    }
+
     const seeded = Array.from({ length: recoverySeedCount }, (_, index) => ({
       key: `crash_test_${String(index + 1).padStart(4, '0')}`,
       value: `durable-value-${String((index * 17 + 11) % 997).padStart(3, '0')}`,
     }));
-    let next: KvEntry[];
-    if (backendMode) {
-      setRecoveryLogs([`[SEED] 正在向后端写入 ${recoverySeedCount} 个测试键`]);
-      try {
-        const oldSeedKeys = entries.filter((entry) => entry.key.startsWith('crash_test_')).map((entry) => entry.key);
-        for (let start = 0; start < oldSeedKeys.length; start += 20) {
-          await Promise.all(oldSeedKeys.slice(start, start + 20).map((key) => sendKvCommand({ cmd: 'delete', key }).catch(() => null)));
-          if (!isActiveRun()) return;
-        }
-        for (let start = 0; start < seeded.length; start += 20) {
-          await Promise.all(seeded.slice(start, start + 20).map((entry) => sendKvCommand({ cmd: 'set', key: entry.key, value: entry.value })));
-          if (!isActiveRun()) return;
-        }
-        next = await refreshBackendEntries();
-      } catch (error) {
-        if (!isActiveRun()) return;
-        setRecoveryLogs([`[ERROR] ${error instanceof Error ? error.message : 'Seed Data 失败'}`]);
-        setServerState('ERROR');
-        return;
-      }
-    } else {
-      const withoutOldSeed = entries.filter((entry) => !entry.key.startsWith('crash_test_'));
-      next = [...seeded, ...withoutOldSeed];
-    }
+    const withoutOldSeed = entries.filter((entry) => !entry.key.startsWith('crash_test_'));
+    const next = [...seeded, ...withoutOldSeed];
     if (!isActiveRun()) return;
     setEntries(next);
     recoverySnapshotRef.current = next.map((entry) => ({ ...entry }));
@@ -1457,24 +1733,23 @@ export default function Home() {
     setRecoveryVerificationEntries([]);
     setRecoveredCount(0);
     setRecoveryLost(0);
+    setRecoveryVerified(false);
     setRecoveryProgress(0);
-    setWalReplayCount(backendMode ? null : 0);
+    setWalReplayCount(0);
     setRecoveryTime(0);
     setRecoveryPhase('PREPARED');
     setRecoveryLogs([
-      `[SEED] ${backendMode ? '后端' : '前端'}写入 ${recoverySeedCount} 个测试键`,
-      `[WAL] ${backendMode ? '写入成功响应确认持久化' : '独立模拟 WAL 已记录'} · ${next.length} keys`,
+      `[SEED] 前端写入 ${recoverySeedCount} 个测试键`,
+      `[WAL] 独立模拟 WAL 已记录 · ${next.length} keys`,
       `[SNAPSHOT] Before 已冻结，仅用于校验 · ${fingerprintFor(next)}`,
     ]);
-    addOperation('SEED', `${recoverySeedCount} keys`, 'write', backendMode ? '后端写入 + Before Snapshot' : '本地 WAL + Before Snapshot', '—');
+    addOperation('SEED', `${recoverySeedCount} keys`, 'write', '本地 WAL + Before Snapshot', '非实测');
   };
 
   const killServer = async () => {
-    if (recoveryPhase !== 'PREPARED' || serverState !== 'ONLINE') return;
+    if (recoveryPhase !== 'PREPARED' || serverState !== 'ONLINE' || recoveryActionPending !== null) return;
     const concurrencyWasRunning = concurrencyRunningRef.current;
     const benchmarkWasRunning = benchmarkRunningRef.current;
-    const concurrencyHadRemoteWork = concurrencyWasRunning || concurrencyStopping;
-    const benchmarkHadRemoteWork = benchmarkWasRunning || benchmarkStopping;
     lifecycleEpochRef.current += 1;
     const epoch = lifecycleEpochRef.current;
     concurrencyRunRef.current += 1;
@@ -1492,19 +1767,28 @@ export default function Home() {
     }
     if (benchmarkWasRunning) interruptBenchmarkRun('当前 Scale 因 Crash Recovery 中断；已完成数据保留');
     if (backendMode) {
+      setRecoveryActionPending('kill');
       try {
-        await killRemoteServer();
+        const state = await killRemoteRecovery();
+        if (!isActiveRun()) return;
+        if (state.phase !== 'CRASHED') {
+          throw new RustKvApiError('INVALID_RESPONSE', `控制器返回 ${state.phase}，未确认进程已终止`);
+        }
+        applyRemoteRecoveryState(state);
+        addOperation('KILL', 'managed server process', 'error', '控制器确认后端已终止', '实测');
       } catch (error) {
         if (!isActiveRun()) return;
-        const pendingStops: Promise<unknown>[] = [];
-        if (concurrencyHadRemoteWork) pendingStops.push(stopRemoteConcurrency());
-        if (benchmarkHadRemoteWork) pendingStops.push(stopRemoteBenchmark());
-        if (pendingStops.length) await Promise.allSettled(pendingStops);
-        if (!isActiveRun()) return;
+        const apiError = error instanceof RustKvApiError ? error : new RustKvApiError('UNKNOWN', '强制终止失败');
         suspendHealthProbeRef.current = false;
-        setRecoveryLogs((previous) => [...previous, `[ERROR] Kill Server 失败 · ${error instanceof Error ? error.message : '未知错误'}`]);
-        return;
+        setRecoveryVerified(false);
+        setRecoveryPhase('ERROR');
+        appendRecoveryLog(`[CLIENT ERROR] ${apiError.code} · ${apiError.message}`);
+        setServerState(apiError.code === 'BACKEND_UNREACHABLE' || apiError.code === 'TIMEOUT' ? 'OFFLINE' : 'ERROR');
+        addOperation('KILL', 'managed server process', 'error', apiError.code, '—');
+      } finally {
+        if (isActiveRun()) setRecoveryActionPending(null);
       }
+      return;
     }
     if (!isActiveRun()) return;
     setEntries([]);
@@ -1516,9 +1800,9 @@ export default function Home() {
     addOperation('KILL', backendMode ? 'managed server process' : 'frontend memory state', 'error', backendMode ? '后端已终止' : '纯前端动画', '—');
   };
 
-  const finalizeRecovery = (memoryEntries: KvEntry[], replayCount: number | null, elapsedSeconds: number) => {
+  const finalizeSimulatedRecovery = (memoryEntries: KvEntry[], replayCount: number, elapsedSeconds: number) => {
     const before = recoverySnapshotRef.current;
-    const verificationEntries = injectRecoveryFailure ? memoryEntries.slice(0, Math.max(0, memoryEntries.length - 2)) : memoryEntries;
+    const verificationEntries = memoryEntries;
     const verificationMap = new Map(verificationEntries.map((entry) => [entry.key, entry.value]));
     const lost = before.filter((entry) => verificationMap.get(entry.key) !== entry.value).length;
     const afterHash = fingerprintFor(verificationEntries);
@@ -1526,6 +1810,7 @@ export default function Home() {
     setRecoveryVerificationEntries(verificationEntries);
     setRecoveredCount(memoryEntries.length);
     setRecoveryLost(lost);
+    setRecoveryVerified(lost === 0 && fingerprintFor(before) === afterHash);
     setAfterFingerprint(afterHash);
     setWalReplayCount(replayCount);
     setRecoveryTime(elapsedSeconds);
@@ -1535,70 +1820,100 @@ export default function Home() {
     setRecoveryPhase('VERIFIED');
     setRecoveryLogs((previous) => [...previous, `[VERIFY] WAL 重建 Memory ${memoryEntries.length} Keys`, `[HASH] Before ${fingerprintFor(before)} · After ${afterHash}`, lost ? `[FAIL] 验证层检测到 ${lost} 个键不一致` : '[PASS] 数量、抽样值与 Hash 全部一致']);
     setLastUpdate('刚刚');
-    addOperation('RESTART', backendMode ? 'backend WAL replay' : 'simulated WAL replay', lost ? 'error' : 'system', lost ? 'CONSISTENCY FAIL' : 'CONSISTENCY PASS', `${elapsedSeconds.toFixed(2)}s`);
+    addOperation('RESTART', 'simulated WAL replay', lost ? 'error' : 'system', lost ? 'CONSISTENCY FAIL' : 'CONSISTENCY PASS · 非实测', `${elapsedSeconds.toFixed(2)}s`);
   };
 
   const restartServer = async () => {
-    if (recoveryPhase !== 'CRASHED') return;
+    if (recoveryPhase !== 'CRASHED' || recoveryActionPending !== null) return;
     clearTimer(recoveryTimerRef);
     const epoch = lifecycleEpochRef.current;
     const runId = ++recoveryRunRef.current;
     const isActiveRun = () => epoch === lifecycleEpochRef.current && runId === recoveryRunRef.current;
-    setServerState('RECOVERING');
-    setRecoveryPhase('RECOVERING');
-    setRecoveryProgress(0);
-    setWalReplayCount(backendMode ? null : 0);
-    setRecoveryLogs((previous) => [...previous, `[BOOT] ${backendMode ? '接入层正在重启后端进程' : '纯前端启动恢复动画'}`, '[SOURCE] 恢复来源 = WAL；Frontend Snapshot 未参与', '[REPLAY] 开始顺序重放 WAL']);
     const startedAt = performance.now();
 
     if (backendMode) {
+      setRecoveryActionPending('restart');
       try {
-        await restartRemoteServer();
+        const initialState = await restartRemoteRecovery();
+        if (!isActiveRun()) return;
+        if (initialState.phase !== 'RECOVERING' && initialState.phase !== 'VERIFIED') {
+          throw new RustKvApiError('INVALID_RESPONSE', `控制器返回 ${initialState.phase}，未确认恢复已开始`);
+        }
+        applyRemoteRecoveryState(initialState);
       } catch (error) {
         if (!isActiveRun()) return;
-        setServerState('ERROR');
-        setRecoveryPhase('CRASHED');
-        setRecoveryLogs((previous) => [...previous, `[ERROR] Restart 失败 · ${error instanceof Error ? error.message : '未知错误'}`]);
+        const apiError = error instanceof RustKvApiError ? error : new RustKvApiError('UNKNOWN', '重启恢复失败');
+        suspendHealthProbeRef.current = false;
+        setRecoveryVerified(false);
+        setRecoveryPhase('ERROR');
+        appendRecoveryLog(`[CLIENT ERROR] ${apiError.code} · ${apiError.message}`);
+        setServerState(apiError.code === 'BACKEND_UNREACHABLE' || apiError.code === 'TIMEOUT' ? 'OFFLINE' : 'ERROR');
+        addOperation('RESTART', 'backend WAL replay', 'error', apiError.code, '—');
         return;
+      } finally {
+        if (isActiveRun()) setRecoveryActionPending(null);
       }
       if (!isActiveRun()) return;
       let attempts = 0;
-      let polling = false;
-      recoveryTimerRef.current = window.setInterval(async () => {
-        if (polling || !isActiveRun()) return;
-        polling = true;
+      const poll = async () => {
+        if (!isActiveRun()) return;
         attempts += 1;
         try {
-          const remoteState = await readRemoteServerState();
+          const remoteState = await readRemoteRecovery();
           if (!isActiveRun()) return;
-          setServerState(remoteState.state);
-          setRecoveryProgress((value) => Math.min(92, value + 5));
-          if (remoteState.state === 'ONLINE') {
-            const restored = await refreshBackendEntries();
+          applyRemoteRecoveryState(remoteState);
+          if (remoteState.phase === 'VERIFIED') {
+            clearTimer(recoveryTimerRef);
+            suspendHealthProbeRef.current = false;
+            setBackendProbeEpoch((value) => value + 1);
+            try {
+              const restored = await refreshBackendEntries();
+              if (isActiveRun()) setEntries(restored);
+            } catch {
+              if (isActiveRun()) setEntries([]);
+            }
             if (!isActiveRun()) return;
-            clearTimer(recoveryTimerRef);
-            finalizeRecovery(restored, remoteState.walReplayCount ?? null, (performance.now() - startedAt) / 1000);
-          } else if (remoteState.state === 'ERROR' || attempts >= 80) {
-            clearTimer(recoveryTimerRef);
-            setServerState('ERROR');
-            setRecoveryPhase('CRASHED');
-            setRecoveryLogs((previous) => [...previous, '[ERROR] 恢复超时或 WAL 校验失败，请检查后端日志']);
+            addOperation('RESTART', 'backend WAL replay', remoteState.verified ? 'system' : 'error', remoteState.verified ? 'CONSISTENCY PASS' : 'CONSISTENCY FAIL', `${(remoteState.recoveryTimeMs / 1000).toFixed(2)}s`);
+            return;
           }
-        } catch {
+          if (remoteState.phase === 'ERROR') {
+            clearTimer(recoveryTimerRef);
+            suspendHealthProbeRef.current = false;
+            setServerState('ERROR');
+            addOperation('RESTART', 'backend WAL replay', 'error', 'RECOVERY ERROR', '—');
+            return;
+          }
+          if (attempts >= 1800) {
+            clearTimer(recoveryTimerRef);
+            suspendHealthProbeRef.current = false;
+            setRecoveryVerified(false);
+            setRecoveryPhase('ERROR');
+            setServerState('ERROR');
+            appendRecoveryLog('[CLIENT ERROR] 恢复状态轮询超过 15 分钟，实验中断');
+            return;
+          }
+          recoveryTimerRef.current = window.setTimeout(() => void poll(), 500);
+        } catch (error) {
           if (!isActiveRun()) return;
-          if (attempts >= 80) {
-            clearTimer(recoveryTimerRef);
-            setServerState('ERROR');
-            setRecoveryPhase('CRASHED');
-            setRecoveryLogs((previous) => [...previous, '[ERROR] 接入层在恢复时持续不可达']);
-          }
-        } finally {
-          polling = false;
+          clearTimer(recoveryTimerRef);
+          suspendHealthProbeRef.current = false;
+          const apiError = error instanceof RustKvApiError ? error : new RustKvApiError('UNKNOWN', '恢复状态查询失败');
+          setRecoveryVerified(false);
+          setRecoveryPhase('ERROR');
+          setServerState(apiError.code === 'BACKEND_UNREACHABLE' || apiError.code === 'TIMEOUT' ? 'OFFLINE' : 'ERROR');
+          appendRecoveryLog(`[CLIENT ERROR] ${apiError.code} · ${apiError.message}`);
         }
-      }, 250);
+      };
+      void poll();
       return;
     }
 
+    setServerState('RECOVERING');
+    setRecoveryPhase('RECOVERING');
+    setRecoveryVerified(false);
+    setRecoveryProgress(0);
+    setWalReplayCount(0);
+    setRecoveryLogs((previous) => [...previous, '[BOOT] 纯前端启动恢复动画', '[SOURCE] 恢复来源 = 模拟 WAL；Frontend Snapshot 未参与', '[REPLAY] 开始模拟顺序重放']);
     const wal = recoveryWalRef.current.map((entry) => ({ ...entry }));
     let step = 0;
     const announced = new Set<number>();
@@ -1618,7 +1933,7 @@ export default function Home() {
       });
       if (nextProgress >= 100) {
         clearTimer(recoveryTimerRef);
-        finalizeRecovery(wal, wal.length, (performance.now() - startedAt) / 1000);
+        finalizeSimulatedRecovery(wal, wal.length, (performance.now() - startedAt) / 1000);
       }
     }, 90);
   };
@@ -1751,11 +2066,11 @@ export default function Home() {
               failBenchmarkJob(job, state.error ?? `${job.clients} Clients 测试被中断`, runId, epoch);
               return;
             }
-            if (attempts >= 180) {
-              failBenchmarkJob(job, `${job.clients} Clients 状态轮询超时`, runId, epoch);
+            if (attempts >= 1800) {
+              failBenchmarkJob(job, `${job.clients} Clients 状态轮询超过 15 分钟`, runId, epoch);
               return;
             }
-            benchmarkTimerRef.current = window.setTimeout(() => void poll(), 320);
+            benchmarkTimerRef.current = window.setTimeout(() => void poll(), 500);
           } catch (error) {
             failBenchmarkJob(job, `${job.clients} Clients 请求失败 · ${error instanceof Error ? error.message : '未知错误'}`, runId, epoch);
           }
@@ -1874,7 +2189,7 @@ export default function Home() {
       setBenchmarkWorkload('MIXED');
     } else if (value === 'B') {
       setBenchmarkResearchVariable('LOCK');
-      setBenchmarkRuntime('Sync');
+      setBenchmarkRuntime('Async');
       setBenchmarkLock('Mutex');
       setBenchmarkWorkload('READ_HEAVY');
     } else {
@@ -1932,7 +2247,8 @@ export default function Home() {
     setConcurrencyFailed(0);
     setRecoveryPhase('IDLE');
     setRecoverySeedCount(100);
-    setInjectRecoveryFailure(false);
+    setRecoveryActionPending(null);
+    setRecoveryVerified(false);
     setRecoveryBeforeCount(0);
     setRecoveredCount(0);
     setRecoveryLost(0);
@@ -1946,7 +2262,7 @@ export default function Home() {
     setRecoveryTime(0);
     setBenchmarkMode('COMPARE');
     setBenchmarkResearchVariable('LOCK');
-    setBenchmarkRuntime('Sync');
+    setBenchmarkRuntime('Async');
     setBenchmarkLock('Mutex');
     setBenchmarkScales([...BENCHMARK_SCALES]);
     setBenchmarkWorkload('READ_HEAVY');
@@ -1977,7 +2293,15 @@ export default function Home() {
     setLastUpdate(nextBackendMode ? formatClock().slice(0, 8) : '刚刚');
   };
 
-  const displayedKeyCount = serverState === 'RECOVERING' ? recoveredCount : entries.length;
+  const displayedKeyCount = backendMode && recoveryPhase !== 'IDLE' && recoveryPhase !== 'ERROR'
+    ? recoveryPhase === 'PREPARED'
+      ? recoveryBeforeCount
+      : recoveryPhase === 'CRASHED'
+        ? 0
+        : recoveredCount
+    : serverState === 'RECOVERING'
+      ? recoveredCount
+      : entries.length;
   const metricStrip: LabMetricItem[] = [
     { label: backendMode ? '后端键总数' : '本地键总数', value: formatNumber(displayedKeyCount), suffix: backendMode ? '来自接入层' : '纯前端内存', accent: 'cyan' },
   ];
@@ -2008,9 +2332,9 @@ export default function Home() {
         <div className="page-title-row"><div><p><Activity size={14} /> RUSTKV SYSTEMS LAB / {activeNavigation.hint.toUpperCase()}</p><h1>{activeNavigation.label}</h1></div><div className={`last-update ${serverState !== 'ONLINE' ? 'frozen' : ''}`}><LabStatusOrb offline={serverState !== 'ONLINE'} /> {serverState === 'ONLINE' ? (backendMode ? '后端状态 · 刚刚' : '纯前端状态 · 刚刚') : `${serverLabels[serverState].label} · 最后更新 ${lastUpdate}`}</div></div>
 
         {activeTab === 'overview' && <Overview backendMode={backendMode} serverState={serverState} operations={operations} lastUpdate={lastUpdate} concurrencyStatus={concurrencyStatus} concurrencyFailed={concurrencyFailed} recoveryPhase={recoveryPhase} recoveryLost={recoveryLost} benchmarkStatus={benchmarkStatus} benchmarkSeries={benchmarkSeries} />}
-        {activeTab === 'kv' && <KvOperations online={serverState === 'ONLINE'} entries={entries} operations={operations} onAction={performKvAction} />}
+        {activeTab === 'kv' && <KvOperations backendMode={backendMode} online={serverState === 'ONLINE'} entries={entries} operations={operations} onAction={performKvAction} />}
         {activeTab === 'concurrency' && <ConcurrencyPage backendMode={backendMode} online={serverState === 'ONLINE'} clients={concurrencyClients} setClients={setConcurrencyClients} requestsPerClient={requestsPerClient} setRequestsPerClient={setRequestsPerClient} workload={concurrencyWorkload} setWorkload={setConcurrencyWorkload} status={concurrencyStatus} progress={concurrencyProgress} successful={concurrencySuccessful} failed={concurrencyFailed} stopping={concurrencyStopping} onStart={startConcurrency} onStop={stopConcurrency} />}
-        {activeTab === 'recovery' && <RecoveryPage backendMode={backendMode} serverState={serverState} phase={recoveryPhase} seedCount={recoverySeedCount} setSeedCount={setRecoverySeedCount} injectFailure={injectRecoveryFailure} setInjectFailure={setInjectRecoveryFailure} beforeCount={recoveryBeforeCount} recoveredCount={recoveredCount} recoveryLost={recoveryLost} progress={recoveryProgress} logs={recoveryLogs} beforeFingerprint={beforeFingerprint} afterFingerprint={afterFingerprint} sampleBefore={recoverySamples} currentEntries={entries} verificationEntries={recoveryVerificationEntries} walReplayCount={walReplayCount} recoveryTime={recoveryTime} onSeed={seedRecoveryData} onKill={killServer} onRestart={restartServer} />}
+        {activeTab === 'recovery' && <RecoveryPage backendMode={backendMode} serverState={serverState} phase={recoveryPhase} seedCount={recoverySeedCount} setSeedCount={setRecoverySeedCount} actionPending={recoveryActionPending} verifiedBySource={recoveryVerified} beforeCount={recoveryBeforeCount} recoveredCount={recoveredCount} recoveryLost={recoveryLost} progress={recoveryProgress} logs={recoveryLogs} beforeFingerprint={beforeFingerprint} afterFingerprint={afterFingerprint} sampleBefore={recoverySamples} currentEntries={entries} verificationEntries={recoveryVerificationEntries} walReplayCount={walReplayCount} recoveryTime={recoveryTime} onSeed={seedRecoveryData} onKill={killServer} onRestart={restartServer} />}
         {activeTab === 'performance' && <PerformancePage backendMode={backendMode} online={serverState === 'ONLINE'} mode={benchmarkMode} setMode={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkMode(value); setBenchmarkPreset(null); }} researchVariable={benchmarkResearchVariable} setResearchVariable={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkResearchVariable(value); setBenchmarkPreset(null); }} runtime={benchmarkRuntime} setRuntime={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkRuntime(value); setBenchmarkPreset(null); }} lock={benchmarkLock} setLock={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkLock(value); setBenchmarkPreset(null); }} scales={benchmarkScales} setScales={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkScales(value); setBenchmarkPreset(null); }} workload={benchmarkWorkload} setWorkload={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkWorkload(value); setBenchmarkPreset(null); }} preset={benchmarkPreset} onApplyPreset={applyBenchmarkPreset} status={benchmarkStatus} progress={benchmarkProgress} series={benchmarkSeries} currentJob={benchmarkCurrentJob} stage={benchmarkStage} environmentResets={benchmarkEnvironmentResets} stopping={benchmarkStopping} onStart={startBenchmark} onStop={stopBenchmark} onRetry={retryFailedBenchmark} />}
       </div>
 

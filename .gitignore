@@ -1,5 +1,6 @@
 /target/
 /data/
+/artifacts/
 /mvp/target/
 /mvp/data/
 *.log

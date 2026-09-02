@@ -4,7 +4,7 @@
 
 本文说明B负责人已经完成的存储与持久化模块，包括代码结构、数据结构、对外接口、WAL、CRC32、启动恢复、异常处理和测试。本文可用于团队交接、课程报告和答辩说明。
 
-B模块的目标不是调用现成数据库，而是在Rust中实现一个小型键值存储核心：运行时使用内存提供快速访问，修改操作同步记录到磁盘，服务器重启时再根据磁盘记录恢复内存状态。
+B模块的目标不是调用现成数据库，而是在 Rust 中实现一个小型键值存储核心：运行时使用内存提供快速访问，修改操作同步记录到磁盘，服务器重启时再根据持久化 Snapshot 与增量 WAL 恢复内存状态。
 
 ## 2. B完成的内容
 
@@ -19,11 +19,15 @@ B模块的目标不是调用现成数据库，而是在Rust中实现一个小型
 | 键和值校验 | `validate_key`、`validate_value` | 已完成 |
 | 不存在键的明确反馈 | `missing_key` | 已完成 |
 | 统一错误类型 | `src/error.rs` | 已完成 |
+| 正式持久化入口 | `src/persistence.rs` | 已完成，导出高级实现 |
+| 高级持久化实现 | `src/persistence_advanced.rs` | 已完成，正式服务使用 |
+| 基础实验对照 | 分支 `experiment/b-storage-comparison-unified` | 已归档，不进入当前项目目录 |
 | WAL追加写入 | `PersistentStore::append_record` | 已完成 |
 | 写入后立即刷盘 | `flush`、`sync_data` | 已完成 |
-| 启动恢复 | `recover`、`replay_record` | 已完成 |
-| 文件截断和格式检测 | `recover` | 已完成 |
-| CRC32内容校验 | `encode_entry`、`verify_checksum` | 已完成 |
+| 启动恢复 | `recover_snapshot`、`recover_wal`、`replay_record` | 已完成 |
+| 文件截断和格式检测 | `load_snapshot_file`、`recover_wal` | 已完成 |
+| CRC32内容校验 | `encode_entry`、`verify_checksum`、`verify_snapshot_checksum` | 已完成 |
+| Snapshot 与压缩 | `PersistentStore::compact` | 已完成 |
 | 损坏文件保护 | 严格恢复策略 | 已完成 |
 | 自动化测试 | `tests/`和模块单元测试 | 已完成 |
 
@@ -41,10 +45,11 @@ B模块的目标不是调用现成数据库，而是在Rust中实现一个小型
   ▼
 PersistentStore（B）
   ├── Store：内存数据和CRUD
-  └── WAL：磁盘日志、CRC32和启动恢复
+  ├── Snapshot：压缩时保存最终有序键值和 last_seq
+  └── 增量 WAL：追加日志、连续序号、CRC32和启动恢复
 ```
 
-C不需要理解BTreeMap节点、CRC32计算或WAL解析，只需要调用 `PersistentStore` 的公开方法。B模块负责保证一次修改不会只进入内存而漏写日志。
+C不需要理解 BTreeMap 节点、CRC32 计算、Snapshot 发布或 WAL 解析，只需要调用 `PersistentStore` 的公开方法。B模块负责保证一次修改不会只进入内存而漏写日志。
 
 ## 4. 内存存储设计
 
@@ -209,9 +214,9 @@ Store::stats()
 `validate_key`和`validate_value`使用 `pub(crate)`：项目内部模块可以调用，项目外部不能直接调用。正常写入和WAL恢复使用同一套规则：
 
 ```text
-客户端正常SET ─┐
-              ├── validate_key / validate_value
-启动重放WAL ──┘
+客户端正常SET ─────┐
+Snapshot加载 ─────┼── validate_key / validate_value
+启动重放增量WAL ──┘
 ```
 
 这样可以避免正常请求拒绝某个值，但恢复程序却接受同一个值的规则不一致问题。
@@ -350,7 +355,7 @@ SET temporary value
 DELETE temporary
 ```
 
-WAL就按相同顺序保存四条记录。服务器重启时，从空 `Store` 开始把四条操作再执行一遍，就能得到退出前的最终状态。
+WAL就按相同顺序保存四条记录。没有 Snapshot 时，服务器从空 `Store` 开始重放；已经 Compact 时，先加载 Snapshot，只重放 `seq > last_seq` 的增量记录。
 
 ### 8.2 操作类型
 
@@ -363,11 +368,17 @@ enum WalRecord {
 
 WAL只记录 `set` 和 `delete`，因为只有它们会改变数据。`get`、`keys`和 `stats` 不改变最终状态，所以不写WAL。
 
-### 8.3 带CRC32的完整记录
+### 8.3 带版本、序号和CRC32的完整记录
 
 ```rust
-struct WalEntry {
+struct WalPayload {
+    version: u8,
+    seq: u64,
     record: WalRecord,
+}
+
+struct WalEntry {
+    payload: WalPayload,
     crc32: String,
 }
 ```
@@ -375,7 +386,7 @@ struct WalEntry {
 实际文件每行类似：
 
 ```json
-{"record":{"op":"set","key":"course","value":"Rust"},"crc32":"B033579D"}
+{"payload":{"version":1,"seq":1,"record":{"op":"set","key":"course","value":"Rust"}},"crc32":"XXXXXXXX"}
 ```
 
 格式规则：
@@ -383,6 +394,8 @@ struct WalEntry {
 - 文件采用UTF-8 JSON Lines。
 - 每一行是一条完整记录。
 - 每条记录必须以LF结尾。
+- `version`用于识别磁盘格式。
+- `seq`是每次成功修改递增的连续序号。
 - `record`保存操作内容。
 - `crc32`是8位十六进制校验和。
 - 整行JSON内容不能超过64 KiB，不计算最后的LF。
@@ -392,10 +405,10 @@ struct WalEntry {
 
 ### 9.1 写入时计算
 
-`encode_entry`先把内部 `WalRecord` 序列化为稳定的JSON字节，然后调用：
+`encode_entry`先把 `version + seq + record` 组成的 `WalPayload` 序列化为稳定的JSON字节，然后调用：
 
 ```rust
-crc32fast::hash(&record_bytes)
+crc32fast::hash(&payload_bytes)
 ```
 
 得到一个32位数，再格式化成8位大写十六进制字符串：
@@ -404,7 +417,7 @@ crc32fast::hash(&record_bytes)
 format!("{:08X}", checksum)
 ```
 
-校验和只根据 `record` 的标准JSON字节计算，不把 `crc32` 字段本身包含进去，否则会形成循环依赖。
+校验和根据 `payload` 的标准JSON字节计算，不把 `crc32` 字段本身包含进去，否则会形成循环依赖。
 
 ### 9.2 恢复时验证
 
@@ -413,7 +426,7 @@ format!("{:08X}", checksum)
 ```text
 读取crc32字符串
 → 检查是否正好8位十六进制
-→ 重新序列化record
+→ 重新序列化payload
 → 重新计算CRC32
 → 与文件中的值比较
 ```
@@ -440,7 +453,7 @@ WAL第 1 行损坏：CRC32校验失败
 
 CRC32用于发现磁盘位翻转、误修改和传输损坏，不是加密，也不能防止有意伪造。攻击者如果同时修改内容并重新计算CRC32，仍然可以制造一条表面合法的记录。
 
-当前CRC32按记录保护内容，但不能可靠发现整条合法记录被删除或多条合法记录被重新排序。提高项可以加入递增序列号或者前后记录哈希链。
+CRC32按记录保护内容，但单独使用时不能可靠发现整条合法记录被删除或多条合法记录被重新排序。当前新版又检查连续 `seq`，因此缺失、重复和乱序也会被发现；它仍不是密码学签名，无法对抗会重新计算 CRC32 并整体伪造文件的攻击者。
 
 ## 10. 修改操作的一致性
 
@@ -449,8 +462,8 @@ CRC32用于发现磁盘位翻转、误修改和传输损坏，不是加密，也
 ```text
 1. 检查存储是否可写
 2. 校验key和value
-3. 构造WalRecord::Set
-4. 序列化操作并计算CRC32
+3. 分配下一个连续seq并构造WalRecord::Set
+4. 序列化完整payload并计算CRC32
 5. 追加完整WalEntry和LF
 6. flush缓冲区
 7. sync_data同步文件
@@ -550,23 +563,31 @@ PersistentStore::open("data/kv.wal")
 ```text
 保存WAL路径
 → 创建缺失的父目录
-→ 以append模式创建或打开文件
-→ 不截断已有内容
-→ 调用recover读取全部记录
-→ 获取记录数和文件大小
+→ 如果正式Snapshot缺失且.bak存在，恢复备份
+→ 校验并加载Snapshot，得到最终键值和last_seq
+→ 以append模式创建或打开WAL，不截断已有内容
+→ 调用recover_wal校验序号并重放last_seq之后的记录
+→ 获取WAL记录数、文件大小和最后序号
 → 重新准备追加写入器
 → 返回恢复完成的PersistentStore
 ```
 
 `append(true)`只向文件末尾添加内容，没有使用 `truncate(true)`，所以重启不会清空历史数据。
 
-### 11.2 `recover`逐行检查
+### 11.2 Snapshot检查
 
-恢复从空内存开始：
+没有 Snapshot 时从空内存和序号0开始；存在 Snapshot 时依次检查：
 
-```rust
-let mut store = Store::new();
-```
+1. 文件不超过64 MiB且不是空白文件。
+2. JSON结构和版本号正确。
+3. Snapshot payload 的CRC32一致。
+4. `last_seq`与内容关系合法。
+5. 所有键值符合业务规则。
+6. 键严格按字典序排列且不能重复。
+
+校验成功后，Snapshot中的最终键值被放回新的 `Store`。
+
+### 11.3 `recover_wal`逐行检查
 
 然后使用 `BufReader::read_until(b'\n', ...)` 逐行读取WAL。每行依次检查：
 
@@ -574,18 +595,19 @@ let mut store = Store::new();
 2. 是否以LF结尾。
 3. 是否为空或者只有空白字符。
 4. 是否是合法JSON。
-5. 是否包含规定的 `record` 和 `crc32`。
+5. 是否包含规定的 `payload` 和 `crc32`，或属于可兼容的基础版 `{record, crc32}`。
 6. 是否有未知字段或未知操作。
 7. CRC32是否为8位十六进制。
 8. CRC32是否与重新计算结果一致。
-9. 键和值是否仍符合业务规则。
-10. `delete`操作恢复到当前步骤时，目标键是否存在。
+9. `version`是否支持、`seq`是否连续。
+10. 键和值是否仍符合业务规则。
+11. `delete`操作恢复到当前步骤时，目标键是否存在。
 
 任意一步失败都会返回带行号的 `CorruptWal`，不会跳过问题记录。
 
-### 11.3 `replay_record`重放
+### 11.4 `replay_record`增量重放
 
-校验通过后，`replay_record`按顺序执行：
+校验通过且记录的 `seq > snapshot.last_seq` 时，`replay_record`才按顺序执行：
 
 ```rust
 WalRecord::Set { key, value }
@@ -612,7 +634,7 @@ course → AdvancedRust
 
 `temporary`不存在，因为最后一条记录将它删除了。
 
-### 11.4 严格恢复策略
+### 11.5 严格恢复策略
 
 发现损坏时程序：
 
@@ -623,6 +645,21 @@ course → AdvancedRust
 - 不自动覆盖或创建一个空数据库代替原数据。
 
 这个策略可以防止程序看似正常启动，但悄悄丢失部分数据。异常文件应由开发人员备份后检查。
+
+### 11.6 `compact`安全压缩
+
+```text
+关闭并同步当前WAL写入器
+→ 从BTreeMap导出有序最终键值
+→ 写kv.snapshot.tmp并sync_data
+→ 回读临时快照，复核CRC32、last_seq和全部键值
+→ 旧正式快照改名为.bak
+→ 发布新的kv.snapshot
+→ 截断并同步已被快照覆盖的WAL
+→ 重新打开WAL追加写入器
+```
+
+关键点是“先发布有效 Snapshot，后清理 WAL”。如果发布后、截断前崩溃，重启时 `last_seq` 会让旧 WAL 记录被校验但不重复执行；如果正式快照尚未发布，旧 Snapshot/WAL 仍可继续恢复。
 
 ## 12. 崩溃场景分析
 
@@ -635,6 +672,8 @@ course → AdvancedRust
 | WAL同步后、内存更新前崩溃 | 重启后根据WAL恢复该操作；客户端可能没有收到成功 |
 | 内存更新后、网络响应前崩溃 | 重启后仍能恢复；客户端可能没有收到成功 |
 | 客户端收到成功后崩溃 | WAL已经同步，重启后可以恢复 |
+| 临时Snapshot写入中崩溃 | `.tmp`不参与启动恢复，继续使用旧Snapshot/WAL |
+| 新Snapshot发布后、WAL截断前崩溃 | 加载新Snapshot，校验WAL并跳过 `seq <= last_seq` 的旧记录 |
 
 设计优先避免“客户端收到成功但重启后数据消失”。在极端崩溃窗口中，可能出现客户端没有收到成功，但操作已经进入WAL并在重启后生效，这比确认成功后丢数据更安全。
 
@@ -681,15 +720,17 @@ wal_records = 2
 
 ## 14. 与C的并发集成
 
-C应当共享：
+C根据实验模式共享以下一种对象：
 
 ```rust
 Arc<Mutex<PersistentStore>>
+Arc<RwLock<PersistentStore>>
 ```
 
 - `Arc`让多个客户端线程持有同一个存储对象。
-- `Mutex`保证同一时刻只有一个线程修改内存和WAL。
+- `Mutex`让所有操作互斥；`RwLock`允许多个只读请求共享读锁。
 - 所有修改经过同一个锁，WAL顺序与内存更新顺序保持一致。
+- `compact`必须使用独占锁，Snapshot发布期间不能混入新的修改。
 
 锁的正确范围：
 
@@ -713,6 +754,8 @@ Arc<Mutex<PersistentStore>>
 | `DELETE` | `PersistentStore::delete` |
 | `KEYS` | `PersistentStore::keys` |
 | `STATUS` | `PersistentStore::len`或 `stats` |
+| `STORAGE_STATUS` | `PersistentStore::stats`、`last_sequence`与Snapshot文件状态 |
+| `COMPACT` | `PersistentStore::compact` |
 | `PING` | 不访问存储 |
 | `QUIT` | 不访问存储，关闭当前连接 |
 
@@ -744,7 +787,7 @@ fn example() -> rust_kv_store::error::Result<()> {
 let store = PersistentStore::open("data/kv.wal")?;
 ```
 
-会重新读取同一WAL并恢复最终状态。
+会重新读取同一组 Snapshot/WAL 并恢复最终状态。
 
 ## 16. 测试与验收
 
@@ -790,7 +833,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-最近一次完整测试结果为29项通过、0项失败。
+当前发布版还包含 Snapshot/压缩专项测试、四种网络组合测试和 HTTP 控制器端到端测试；最终数量以 `cargo test --all-targets --all-features` 的实际输出为准。
 
 ## 17. 已完成标准
 
@@ -802,31 +845,30 @@ B模块现在满足以下基础验收要求：
 - 所有修改通过统一持久化接口执行。
 - 每次成功修改都会及时追加并同步WAL。
 - WAL同步完成后才更新内存。
-- 使用同一WAL重新启动可以恢复最终状态。
-- 能检测文件截断、非法格式、非法业务记录和内容校验失败。
+- 使用同一组 Snapshot/WAL 重新启动可以恢复最终状态。
+- 能检测文件截断、非法格式、非法业务记录、序号异常和内容校验失败。
 - 问题文件不会被自动忽略或覆盖。
 
-## 18. 当前限制和提高项
+## 18. 已实现提高项与剩余边界
 
-以下功能尚未实现，不影响当前基础阶段验收：
+当前发布版默认使用高级持久化实现，已经完成：
 
-1. **Snapshot快照**：当前每次启动都从第一条WAL重放，日志很大时启动会变慢。
-2. **WAL压缩与轮换**：历史记录会持续增长，尚未自动清理已被覆盖的旧操作。
-3. **格式版本号**：当前新格式严格要求CRC32，不自动兼容旧的无校验和WAL。
-4. **操作序列号**：目前不能可靠发现完整合法记录被删除或调换顺序。
-5. **跨进程文件锁**：只设计了单服务器进程，多进程同时打开同一WAL不受支持。
-6. **事务和批量操作**：一次接口调用只修改一个键。
-7. **安全认证**：CRC32不是密码学签名，不能防止有意伪造。
+1. **格式版本号与连续序号**：新版 WAL 把 `version + seq + record` 一起纳入 CRC32，可检测记录缺失、重复和乱序。
+2. **旧 WAL 兼容**：可以读取基础版 `{record, crc32}`，后续写入从正确序号继续，不改写旧记录。
+3. **Snapshot 快照**：保存某个 `last_seq` 对应的最终有序键值状态，快照本身也带 CRC32。
+4. **安全 WAL 压缩**：`compact()` 先写 `.tmp`、同步并重新校验，再发布正式快照，最后截断已覆盖 WAL。
+5. **中断恢复**：正式快照缺失但 `.bak` 存在时恢复备份；未发布 `.tmp` 不参与恢复。
+6. **真实前后端操作**：TCP `storage_status/compact` 和 HTTP `/api/storage/*` 可以展示状态并手动压缩。
+7. **基础/创新对照**：基础实现和统一 benchmark 已归档到 `experiment/b-storage-comparison-unified`；当前正式代码只保留高级实现，前端继续展示已保存的历史实测证据。
 
-推荐的提高顺序为：
+仍未实现的边界：
 
-```text
-格式版本号和操作序列号
-→ Snapshot
-→ WAL压缩与轮换
-→ 快照原子发布和崩溃恢复
-→ 性能指标与压力测试
-```
+1. 自动阈值压缩和后台压缩线程；当前由用户显式触发，避免普通请求中突然产生暂停。
+2. 跨进程文件锁；只允许一个服务器进程拥有一组 Snapshot/WAL 文件。
+3. 事务、批量原子操作和 TTL 自动过期。
+4. 密码学防篡改；CRC32用于发现意外损坏，不是数字签名。
+
+完整流程和实测结果见《B模块 Snapshot 与 WAL 压缩对比》。
 
 ## 19. B与A、C的职责边界
 
@@ -840,10 +882,10 @@ B模块现在满足以下基础验收要求：
 ### B交给C
 
 - `PersistentStore::open`作为服务器启动入口。
-- `Arc<Mutex<PersistentStore>>`作为共享存储类型。
-- CRUD、KEYS和STATUS接口。
+- `SharedStore` 中的 `Arc<Mutex<PersistentStore>>` 或 `Arc<RwLock<PersistentStore>>`。
+- CRUD、KEYS、STATUS、STORAGE_STATUS 和 COMPACT 接口。
 - `Response::from_error`所需的 `AppError`。
-- WAL恢复失败时拒绝启动的约定。
+- Snapshot/WAL恢复失败时拒绝启动的约定。
 
 ### B不负责
 
@@ -855,14 +897,16 @@ B模块现在满足以下基础验收要求：
 
 ## 20. 总结
 
-B模块实现了一个“内存索引 + 预写日志”的小型持久化键值存储。`BTreeMap`负责运行时的有序数据访问，WAL负责保存所有成功修改，CRC32负责发现记录内容损坏，启动恢复负责从磁盘重建内存状态，统一错误体系负责把底层异常转换成稳定、明确的反馈。
+B模块实现了一个“内存索引 + Snapshot + 增量预写日志”的小型持久化键值存储。`BTreeMap`负责运行时的有序数据访问，Snapshot保存压缩时的最终状态，带连续序号的WAL保存后续成功修改，CRC32负责发现内容损坏，启动恢复负责从两类持久化文件重建内存状态，统一错误体系负责把底层异常转换成稳定、明确的反馈。
 
 最关键的设计原则是：
 
 ```text
-修改数据：校验 → CRC32 → WAL追加 → flush → sync_data → 更新内存
+修改数据：校验 → 分配seq → CRC32 → WAL追加 → flush → sync_data → 更新内存
 
-启动恢复：逐行读取 → 格式检查 → CRC32验证 → 业务校验 → 顺序重放
+启动恢复：校验并加载Snapshot → 逐行检查WAL → CRC32与seq验证 → 只重放增量记录
+
+手动压缩：写并校验.tmp → 发布Snapshot → 截断已覆盖WAL → 继续追加新序号
 ```
 
 这保证了C只要正确使用 `PersistentStore`，就不会出现服务器只修改内存却忘记持久化的问题。

@@ -15,6 +15,15 @@ fn checked_line(record: &[u8]) -> Vec<u8> {
     line
 }
 
+fn checked_current_line(seq: u64, record: &[u8]) -> Vec<u8> {
+    let record = std::str::from_utf8(record).unwrap();
+    let payload = format!(r#"{{"version":1,"seq":{seq},"record":{record}}}"#);
+    let crc32 = crc32fast::hash(payload.as_bytes());
+    let mut line = format!(r#"{{"payload":{payload},"crc32":"{crc32:08X}"}}"#).into_bytes();
+    line.push(b'\n');
+    line
+}
+
 fn assert_corrupt(error: AppError, expected_line: usize, message: &str) {
     assert_eq!(error.code(), ErrorCode::StorageError);
     match error {
@@ -100,8 +109,8 @@ fn successful_mutations_are_complete_json_lines() {
     assert_eq!(lines.len(), 3);
     assert!(lines.last().unwrap().is_empty());
 
-    let expected_set = checked_line(br#"{"op":"set","key":"course","value":"Rust"}"#);
-    let expected_delete = checked_line(br#"{"op":"delete","key":"course"}"#);
+    let expected_set = checked_current_line(1, br#"{"op":"set","key":"course","value":"Rust"}"#);
+    let expected_delete = checked_current_line(2, br#"{"op":"delete","key":"course"}"#);
     assert_eq!(lines[0], &expected_set[..expected_set.len() - 1]);
     assert_eq!(lines[1], &expected_delete[..expected_delete.len() - 1]);
 }
