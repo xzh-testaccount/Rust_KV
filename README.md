@@ -71,4 +71,5 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start_frontend.ps1
 - [协议与持久化设计](docs/协议与持久化设计.md)：JSON Lines 协议、错误码、WAL 格式与恢复规则。
 - [B模块存储与持久化说明](docs/B模块存储与持久化说明.md)：内存存储、WAL、CRC32、恢复流程和交接说明。
 - [B模块Snapshot与WAL压缩对比](docs/B模块Snapshot与WAL压缩对比.md)：基础/创新代码、实验输入、原始数据和结果解释。
+- [网络层设计文档](docs/网络层设计文档.md)：异步客户端和异步服务端核心组件以及功能概述
 - [答辩真实后端指南](docs/P-06真实后端验收.md)：启动、接口、四段演示、真实性边界和故障处理。
