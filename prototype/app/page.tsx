@@ -11,7 +11,6 @@ import {
 import {
   Activity,
   ArrowRight,
-  Bell,
   Boxes,
   Check,
   CheckCircle2,
@@ -26,18 +25,16 @@ import {
   HardDrive,
   KeyRound,
   LayoutDashboard,
+  ListChecks,
   List,
-  MessageSquare,
   Network,
   Pause,
   Play,
   Plus,
   Presentation,
-  Radio,
   RefreshCcw,
   RotateCcw,
   Search,
-  Send,
   Server,
   ShieldAlert,
   ShieldCheck,
@@ -50,11 +47,11 @@ import {
   Zap,
 } from 'lucide-react';
 import {
-  Bar,
-  BarChart,
   CartesianGrid,
+  Legend,
   Line,
   LineChart,
+  ReferenceDot,
   ReferenceLine,
   XAxis,
   YAxis,
@@ -88,22 +85,42 @@ import {
   LabProgress,
   LabStatusOrb,
   LabStatusPill,
+  LAB_BENCHMARK_SERIES_COLORS,
   type LabMetricItem,
 } from '@/components/design_lab';
+import {
+  RustKvApiError,
+  killRemoteServer,
+  readRemoteBenchmark,
+  readRemoteConcurrency,
+  readRemoteServerState,
+  resetRemoteBenchmarkEnvironment,
+  restartRemoteServer,
+  sendKvCommand,
+  startRemoteBenchmark,
+  startRemoteConcurrency,
+  stopRemoteBenchmark,
+  stopRemoteConcurrency,
+} from '@/lib/rustkv-api';
 
 type TabId =
   | 'overview'
   | 'kv'
   | 'concurrency'
   | 'recovery'
-  | 'performance'
-  | 'pubsub';
+  | 'performance';
 
 type ServerState = 'ONLINE' | 'OFFLINE' | 'STARTING' | 'RECOVERING' | 'ERROR';
 type OperationTone = 'read' | 'write' | 'delete' | 'system' | 'error';
 type ExperimentStatus = 'IDLE' | 'RUNNING' | 'COMPLETED' | 'STOPPED' | 'INTERRUPTED';
 type RecoveryPhase = 'IDLE' | 'PREPARED' | 'CRASHED' | 'RECOVERING' | 'VERIFIED';
-type Workload = '读取为主' | '写入为主' | '混合读写';
+type Workload = 'READ_HEAVY' | 'MIXED' | 'WRITE_HEAVY';
+type RuntimeModel = 'Sync' | 'Async';
+type LockStrategy = 'Mutex' | 'RwLock';
+type ExperimentMode = 'SINGLE' | 'COMPARE';
+type ResearchVariable = 'RUNTIME' | 'LOCK' | 'WORKLOAD';
+type BenchmarkPreset = 'A' | 'B' | 'C' | null;
+type ScaleStatus = 'WAITING' | 'RUNNING' | 'DONE' | 'FAILED';
 
 type KvEntry = {
   key: string;
@@ -135,34 +152,51 @@ type BenchmarkPoint = {
   p50: number;
   p95: number;
   p99: number;
-  success: number;
 };
 
-type Subscriber = {
-  id: number;
-  name: string;
-  active: boolean;
-  received: string[];
+type BenchmarkConfig = {
+  runtime: RuntimeModel;
+  lock: LockStrategy;
+  workload: Workload;
+  requests: number;
 };
 
-type CompactResult = {
-  beforeRecords: number;
-  beforeBytes: number;
-  afterRecords: number;
-  afterBytes: number;
+type BenchmarkSeries = {
+  id: 'single' | 'a' | 'b' | 'c';
+  label: string;
+  role: '单次实验' | '对照组' | '实验组';
+  config: BenchmarkConfig;
+  points: BenchmarkPoint[];
+  scaleStatus: Record<number, ScaleStatus>;
+};
+
+type BenchmarkJob = {
+  seriesId: BenchmarkSeries['id'];
+  clients: number;
 };
 
 const INITIAL_KEY_COUNT = 327;
-const INITIAL_WAL_RECORDS = 12_430;
-const INITIAL_WAL_BYTES = 2.8 * 1024 * 1024;
+const BENCHMARK_REQUESTS = 10_000;
+const BENCHMARK_SCALES = [1, 10, 50, 100] as const;
+
+const workloadMeta: Record<Workload, { label: string; ratio: string; short: string }> = {
+  READ_HEAVY: { label: 'Read Heavy', ratio: '90R / 10W', short: '读多写少' },
+  MIXED: { label: 'Mixed', ratio: '50R / 50W', short: '均衡读写' },
+  WRITE_HEAVY: { label: 'Write Heavy', ratio: '10R / 90W', short: '写入为主' },
+};
+
+const researchVariableLabels: Record<ResearchVariable, string> = {
+  RUNTIME: '并发模型',
+  LOCK: '锁策略',
+  WORKLOAD: '工作负载',
+};
 
 const navigation = [
   { id: 'overview' as const, label: '系统总览', hint: 'Overview', icon: LayoutDashboard },
   { id: 'kv' as const, label: '键值操作', hint: 'KV Operations', icon: Database },
   { id: 'concurrency' as const, label: '并发实验', hint: 'Concurrency', icon: Network },
   { id: 'recovery' as const, label: '崩溃恢复', hint: 'Crash Recovery', icon: ShieldCheck },
-  { id: 'performance' as const, label: '性能测试', hint: 'Performance', icon: Gauge },
-  { id: 'pubsub' as const, label: '发布订阅', hint: 'Pub / Sub', icon: Radio },
+  { id: 'performance' as const, label: '性能实验室', hint: 'Performance Lab', icon: Gauge },
 ];
 
 const serverLabels: Record<ServerState, { label: string; detail: string }> = {
@@ -182,7 +216,7 @@ const initialNamedEntries: KvEntry[] = [
   { key: 'config:port', value: '7878' },
   { key: 'session:demo', value: 'ready' },
   { key: 'feature:recovery', value: 'enabled' },
-  { key: 'feature:pubsub', value: 'prototype' },
+  { key: 'feature:performance_lab', value: 'ready' },
 ];
 
 function makeInitialEntries(): KvEntry[] {
@@ -241,15 +275,10 @@ function validateValue(value: string): KvResult | null {
   return null;
 }
 
-function formatBytes(value: number) {
-  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
-  if (value >= 1024) return `${Math.round(value / 1024)} KB`;
-  return `${Math.round(value)} B`;
-}
-
 function fingerprintFor(entries: KvEntry[]) {
   let hash = 2166136261;
-  for (const entry of entries) {
+  const ordered = [...entries].sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
+  for (const entry of ordered) {
     const text = `${entry.key}=${entry.value};`;
     for (let index = 0; index < text.length; index += 1) {
       hash ^= text.charCodeAt(index);
@@ -261,67 +290,155 @@ function fingerprintFor(entries: KvEntry[]) {
 
 const initialOperations: OperationLog[] = [];
 
-const simulationBenchmarkTemplate: BenchmarkPoint[] = [
-  { clients: 1, qps: 1480, p50: 0.42, p95: 0.9, p99: 1.4, success: 100 },
-  { clients: 10, qps: 7920, p50: 0.74, p95: 1.8, p99: 3.1, success: 100 },
-  { clients: 50, qps: 12_340, p50: 1.3, p95: 4.7, p99: 8.2, success: 99.99 },
-  { clients: 100, qps: 11_760, p50: 2.5, p95: 8.9, p99: 15.6, success: 99.97 },
-];
+function makeScaleStatus(scales: number[]): Record<number, ScaleStatus> {
+  return Object.fromEntries(scales.map((scale) => [scale, 'WAITING'])) as Record<number, ScaleStatus>;
+}
 
-const throughputChartConfig = {
-  qps: { label: '吞吐量（req/s）', color: '#2add9d' },
-} satisfies ChartConfig;
+function makeBenchmarkPoint(config: BenchmarkConfig, clients: number): BenchmarkPoint {
+  const scaleIndex = BENCHMARK_SCALES.indexOf(clients as (typeof BENCHMARK_SCALES)[number]);
+  const baseThroughput = [1580, 7680, 11_920, 11_180][Math.max(0, scaleIndex)];
+  const baseP99 = [1.35, 3.05, 8.4, 15.2][Math.max(0, scaleIndex)];
+  const concurrencyFactor = config.runtime === 'Async'
+    ? [0.97, 1.04, 1.16, 1.24][Math.max(0, scaleIndex)]
+    : [1.03, 1, 0.9, 0.78][Math.max(0, scaleIndex)];
+  const lockFactor = config.lock === 'RwLock'
+    ? config.workload === 'READ_HEAVY'
+      ? [1.02, 1.08, 1.25, 1.38][Math.max(0, scaleIndex)]
+      : config.workload === 'WRITE_HEAVY'
+        ? [0.99, 0.96, 0.91, 0.87][Math.max(0, scaleIndex)]
+        : [1, 1.03, 1.08, 1.1][Math.max(0, scaleIndex)]
+    : 1;
+  const workloadFactor = config.workload === 'READ_HEAVY' ? 1.16 : config.workload === 'WRITE_HEAVY' ? 0.69 : 1;
+  const qps = Math.round(baseThroughput * concurrencyFactor * lockFactor * workloadFactor);
+  const workloadLatency = config.workload === 'READ_HEAVY' ? 0.82 : config.workload === 'WRITE_HEAVY' ? 1.48 : 1;
+  const runtimeLatency = config.runtime === 'Async'
+    ? [1.04, 0.98, 0.85, 0.78][Math.max(0, scaleIndex)]
+    : [0.96, 1, 1.12, 1.28][Math.max(0, scaleIndex)];
+  const lockLatency = config.lock === 'RwLock'
+    ? config.workload === 'READ_HEAVY'
+      ? [0.98, 0.92, 0.78, 0.68][Math.max(0, scaleIndex)]
+      : config.workload === 'WRITE_HEAVY'
+        ? [1.01, 1.06, 1.16, 1.25][Math.max(0, scaleIndex)]
+        : [1, 0.98, 0.94, 0.92][Math.max(0, scaleIndex)]
+    : 1;
+  const p99 = Number((baseP99 * workloadLatency * runtimeLatency * lockLatency).toFixed(2));
+  return {
+    clients,
+    qps,
+    p50: Number((p99 * 0.22).toFixed(2)),
+    p95: Number((p99 * 0.61).toFixed(2)),
+    p99,
+  };
+}
 
-const latencyChartConfig = {
-  p50: { label: 'P50 延迟', color: '#36cfe2' },
-  p95: { label: 'P95 延迟', color: '#a78bfa' },
-  p99: { label: 'P99 延迟', color: '#f09a58' },
-} satisfies ChartConfig;
+function buildBenchmarkSeries(
+  mode: ExperimentMode,
+  researchVariable: ResearchVariable,
+  baseConfig: BenchmarkConfig,
+  scales: number[],
+): BenchmarkSeries[] {
+  const makeSeries = (
+    id: BenchmarkSeries['id'],
+    label: string,
+    role: BenchmarkSeries['role'],
+    config: BenchmarkConfig,
+  ): BenchmarkSeries => ({ id, label, role, config, points: [], scaleStatus: makeScaleStatus(scales) });
+
+  if (mode === 'SINGLE') {
+    return [makeSeries('single', `${baseConfig.runtime} · ${baseConfig.lock} · ${workloadMeta[baseConfig.workload].label}`, '单次实验', baseConfig)];
+  }
+  if (researchVariable === 'RUNTIME') {
+    return [
+      makeSeries('a', 'Sync', '对照组', { ...baseConfig, runtime: 'Sync' }),
+      makeSeries('b', 'Async', '实验组', { ...baseConfig, runtime: 'Async' }),
+    ];
+  }
+  if (researchVariable === 'LOCK') {
+    return [
+      makeSeries('a', 'Mutex', '对照组', { ...baseConfig, lock: 'Mutex' }),
+      makeSeries('b', 'RwLock', '实验组', { ...baseConfig, lock: 'RwLock' }),
+    ];
+  }
+  return [
+    makeSeries('a', 'Read Heavy', '对照组', { ...baseConfig, workload: 'READ_HEAVY' }),
+    makeSeries('b', 'Mixed', '实验组', { ...baseConfig, workload: 'MIXED' }),
+    makeSeries('c', 'Write Heavy', '实验组', { ...baseConfig, workload: 'WRITE_HEAVY' }),
+  ];
+}
+
+function percentageChange(from: number, to: number) {
+  if (!from) return 0;
+  return (to - from) / from * 100;
+}
+
+function formatSignedPercentage(value: number) {
+  const normalized = Math.abs(value) < 0.05 ? 0 : value;
+  return `${normalized > 0 ? '+' : ''}${normalized.toFixed(1)}%`;
+}
+
+function workloadForApi(workload: Workload): 'read' | 'mixed' | 'write' {
+  if (workload === 'READ_HEAVY') return 'read';
+  if (workload === 'WRITE_HEAVY') return 'write';
+  return 'mixed';
+}
+
+function isValidBenchmarkPoint(point: BenchmarkPoint) {
+  return [point.clients, point.qps, point.p50, point.p95, point.p99].every(Number.isFinite)
+    && point.clients > 0
+    && point.qps >= 0
+    && point.p50 >= 0
+    && point.p50 <= point.p95
+    && point.p95 <= point.p99;
+}
 
 function Overview({
+  backendMode,
   serverState,
   operations,
   lastUpdate,
   concurrencyStatus,
-  concurrencyThroughput,
+  concurrencyFailed,
   recoveryPhase,
   recoveryLost,
-  benchmarkData,
+  benchmarkStatus,
+  benchmarkSeries,
 }: {
+  backendMode: boolean;
   serverState: ServerState;
   operations: OperationLog[];
   lastUpdate: string;
   concurrencyStatus: ExperimentStatus;
-  concurrencyThroughput: number;
+  concurrencyFailed: number;
   recoveryPhase: RecoveryPhase;
   recoveryLost: number;
-  benchmarkData: BenchmarkPoint[];
+  benchmarkStatus: ExperimentStatus;
+  benchmarkSeries: BenchmarkSeries[];
 }) {
   const online = serverState === 'ONLINE';
-  const peak = benchmarkData.length ? Math.max(...benchmarkData.map((item) => item.qps)) : 0;
+  const benchmarkPointCount = benchmarkSeries.reduce((count, series) => count + series.points.length, 0);
   return (
     <section className="overview-grid lab-page" aria-label="系统总览">
       <LabPanel className={`server-card ${online ? '' : 'offline-panel'}`}>
         <div className="panel-kicker"><Server size={15} /> 服务节点</div>
         <div className={`server-state state-${serverState.toLowerCase()}`}><LabStatusOrb offline={!online} /> {serverLabels[serverState].label}</div>
-        <p className="muted">目标地址 127.0.0.1:7878 · 本次不连接后端</p>
+        <p className="muted">{backendMode ? '目标地址 127.0.0.1:7878 · 答辩模式请求接入层' : '纯前端 UI / 动画测试 · 不连接后端'}</p>
         <div className="frontend-scope">
-          <div><span>状态来源</span><strong>前端本地状态机</strong></div>
-          <div><span>网络请求</span><strong>未发送</strong></div>
-          <div><span>数据范围</span><strong>仅当前页面会话</strong></div>
+          <div><span>运行模式</span><strong>{backendMode ? '答辩模式 · 后端实测' : '纯前端模式 · UI 测试'}</strong></div>
+          <div><span>状态来源</span><strong>{backendMode ? '接入层接口响应' : '前端本地状态机'}</strong></div>
+          <div><span>网络请求</span><strong>{backendMode ? '按操作发送' : '不发送'}</strong></div>
         </div>
         <div className={online ? 'healthy-row' : 'error-row'}>
           {online ? <CheckCircle2 size={15} /> : <WifiOff size={15} />}
-          {online ? '前端交互状态正常，可开始本地演示' : `本地模拟已切换为离线 · ${lastUpdate}`}
+          {online ? (backendMode ? '接入层状态正常，可开始答辩实测' : '前端交互状态正常，可测试 UI 与动画') : `${backendMode ? '后端连接' : '本地模拟'}已离线 · ${lastUpdate}`}
         </div>
       </LabPanel>
 
       <LabPanel className="experiment-card">
-        <LabPanelHeader icon={<Boxes size={15} />} eyebrow="本地实验" title="页面交互进度" action={<span className="prototype-label">前端本地模拟</span>} />
+        <LabPanelHeader icon={<Boxes size={15} />} eyebrow="答辩流程" title="四步实验进度" action={<span className="prototype-label">{backendMode ? '后端实测模式' : '纯前端 UI 测试'}</span>} />
         <div className="experiment-list">
-          <div><span className="experiment-icon cyan"><Network size={17} /></span><p><strong>多客户端并发</strong><small>本地计时器驱动活动矩阵</small></p><b>{concurrencyThroughput ? formatNumber(concurrencyThroughput) : '—'} <small>模拟请求/秒</small></b><em>{concurrencyStatus === 'RUNNING' ? '运行中' : concurrencyStatus === 'COMPLETED' ? '模拟完成' : concurrencyStatus === 'STOPPED' ? '已停止' : '待运行'}</em></div>
-          <div><span className="experiment-icon green"><ShieldCheck size={17} /></span><p><strong>崩溃恢复</strong><small>本地快照 · 故障状态演示</small></p><b>{recoveryPhase === 'VERIFIED' ? recoveryLost : '—'} <small>模拟丢失</small></b><em>{recoveryPhase === 'VERIFIED' ? (recoveryLost > 0 ? '发现不一致' : '模拟通过') : '待运行'}</em></div>
-          <div><span className="experiment-icon violet"><Gauge size={17} /></span><p><strong>性能测试</strong><small>运行后逐点生成演示数据</small></p><b>{peak ? formatNumber(peak) : '—'} <small>模拟请求/秒</small></b><em>{benchmarkData.length ? '模拟完成' : '待运行'}</em></div>
+          <div><span className="experiment-icon cyan"><Network size={17} /></span><p><strong>多客户端并发</strong><small>只验证完成数、成功数与失败数</small></p><b>{concurrencyStatus === 'COMPLETED' ? (concurrencyFailed ? 'FAIL' : 'PASS') : '—'} <small>正确性</small></b><em>{concurrencyStatus === 'RUNNING' ? '运行中' : concurrencyStatus === 'COMPLETED' ? '已校验' : concurrencyStatus === 'STOPPED' || concurrencyStatus === 'INTERRUPTED' ? '未完成' : '待运行'}</em></div>
+          <div><span className="experiment-icon green"><ShieldCheck size={17} /></span><p><strong>崩溃恢复</strong><small>WAL 恢复 · Snapshot 只负责校验</small></p><b>{recoveryPhase === 'VERIFIED' ? recoveryLost : '—'} <small>丢失键</small></b><em>{recoveryPhase === 'VERIFIED' ? (recoveryLost > 0 ? 'CONSISTENCY FAIL' : 'CONSISTENCY PASS') : '待运行'}</em></div>
+          <div><span className="experiment-icon violet"><Gauge size={17} /></span><p><strong>性能实验室</strong><small>控制变量 · 自动多规模 / A/B</small></p><b>{benchmarkPointCount || '—'} <small>已收集点</small></b><em>{benchmarkStatus === 'RUNNING' ? '运行中' : benchmarkStatus === 'COMPLETED' ? '已完成' : benchmarkStatus === 'INTERRUPTED' ? '可重试' : '待运行'}</em></div>
         </div>
       </LabPanel>
 
@@ -348,13 +465,14 @@ function KvOperations({
   online: boolean;
   entries: KvEntry[];
   operations: OperationLog[];
-  onAction: (action: KvAction, key: string, value: string) => KvResult;
+  onAction: (action: KvAction, key: string, value: string) => Promise<KvResult>;
 }) {
   const [key, setKey] = useState('course:name');
   const [value, setValue] = useState('Rust 网络 KV 存储');
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(0);
   const [view, setView] = useState<'grid' | 'list'>('grid');
+  const [pending, setPending] = useState(false);
   const [result, setResult] = useState<KvResult>({
     kind: 'info',
     title: '操作台已就绪',
@@ -377,10 +495,15 @@ function KvOperations({
     message: '请先在“崩溃恢复”页面执行模拟重启，再继续键值操作。',
   };
 
-  const execute = (action: KvAction) => {
-    const nextResult = onAction(action, key, value);
-    setResult(nextResult);
-    if (action === 'GET' && nextResult.value !== undefined) setValue(nextResult.value);
+  const execute = async (action: KvAction) => {
+    setPending(true);
+    try {
+      const nextResult = await onAction(action, key, value);
+      setResult(nextResult);
+      if (action === 'GET' && nextResult.value !== undefined) setValue(nextResult.value);
+    } finally {
+      setPending(false);
+    }
   };
 
   const selectEntry = (entry: KvEntry) => {
@@ -394,14 +517,14 @@ function KvOperations({
       <LabPanel className="command-panel">
         <LabPanelHeader icon={<KeyRound size={15} />} eyebrow="命令面板" title="键值基础操作" action={<LabStatusPill tone={online ? 'online' : 'offline'}>{online ? '可执行' : '连接已断开'}</LabStatusPill>} />
         <div className="form-stack">
-          <LabField label="键 Key" htmlFor="kv-key"><Input id="kv-key" value={key} disabled={!online} onChange={(event) => setKey(event.target.value)} placeholder="例如 user:1001" /></LabField>
-          <LabField label="值 Value" htmlFor="kv-value"><Input id="kv-value" value={value} disabled={!online} onChange={(event) => setValue(event.target.value)} placeholder="请输入字符串值" /></LabField>
+          <LabField label="键 Key" htmlFor="kv-key"><Input id="kv-key" value={key} disabled={!online || pending} onChange={(event) => setKey(event.target.value)} placeholder="例如 user:1001" /></LabField>
+          <LabField label="值 Value" htmlFor="kv-value"><Input id="kv-value" value={value} disabled={!online || pending} onChange={(event) => setValue(event.target.value)} placeholder="请输入字符串值" /></LabField>
         </div>
         <div className="kv-actions">
-          <LabButton tone="success" disabled={!online} onClick={() => execute('SET')}><Plus /> 写入 SET</LabButton>
-          <LabButton tone="info" disabled={!online} onClick={() => execute('GET')}><Search /> 读取 GET</LabButton>
-          <LabButton tone="danger" disabled={!online} onClick={() => execute('DELETE')}><Trash2 /> 删除</LabButton>
-          <LabButton tone="secondary" disabled={!online} onClick={() => execute('KEYS')}><List /> 查看全部键</LabButton>
+          <LabButton tone="success" disabled={!online || pending} onClick={() => execute('SET')}><Plus /> 写入 SET</LabButton>
+          <LabButton tone="info" disabled={!online || pending} onClick={() => execute('GET')}><Search /> 读取 GET</LabButton>
+          <LabButton tone="danger" disabled={!online || pending} onClick={() => execute('DELETE')}><Trash2 /> 删除</LabButton>
+          <LabButton tone="secondary" disabled={!online || pending} onClick={() => execute('KEYS')}><List /> {pending ? '请求中…' : '查看全部键'}</LabButton>
         </div>
         <div className={`command-result ${visibleResult.kind}`} aria-live="polite">
           <span>{visibleResult.kind === 'success' ? <CheckCircle2 /> : visibleResult.kind === 'error' ? <CircleAlert /> : <TerminalSquare />}</span>
@@ -445,6 +568,7 @@ function KvOperations({
 }
 
 function ConcurrencyPage({
+  backendMode,
   online,
   clients,
   setClients,
@@ -456,11 +580,11 @@ function ConcurrencyPage({
   progress,
   successful,
   failed,
-  throughput,
-  elapsed,
+  stopping,
   onStart,
   onStop,
 }: {
+  backendMode: boolean;
   online: boolean;
   clients: number;
   setClients: (value: number) => void;
@@ -472,29 +596,30 @@ function ConcurrencyPage({
   progress: number;
   successful: number;
   failed: number;
-  throughput: number;
-  elapsed: number;
+  stopping: boolean;
   onStart: () => void;
   onStop: () => void;
 }) {
   const running = status === 'RUNNING';
+  const controlsLocked = running || stopping;
   const total = clients * requestsPerClient;
   const renderedClients = Array.from({ length: Math.min(100, clients) }, (_, index) => index);
   const gridColumns = clients <= 1 ? 1 : clients <= 10 ? Math.min(5, clients) : 10;
   const currentCompleted = successful + failed;
+  const passed = status === 'COMPLETED' && progress >= 100 && failed === 0 && currentCompleted === total;
 
   return (
     <section className="concurrency-page lab-page">
       <LabPanel className="experiment-config">
         <div className="config-title"><span className="panel-kicker"><Users size={15} /> 实验参数</span><h2>让多个客户端同时读写</h2></div>
-        <div className="config-group"><span>客户端数量</span><div className="preset-buttons">{[1, 10, 50, 100].map((value) => <button key={value} className={clients === value ? 'active' : ''} disabled={running} onClick={() => setClients(value)}>{value}</button>)}</div></div>
-        <LabField className="number-config" label="每客户端请求数" htmlFor="requests-per-client"><Input id="requests-per-client" type="number" min="10" max="1000" value={requestsPerClient} disabled={running} onChange={(event) => setRequestsPerClient(Math.max(10, Number(event.target.value) || 10))} /></LabField>
-        <div className="config-group"><span>负载类型</span><div className="segmented">{(['读取为主', '写入为主', '混合读写'] as Workload[]).map((item) => <button key={item} className={workload === item ? 'active' : ''} disabled={running} onClick={() => setWorkload(item)}>{item}</button>)}</div></div>
-        {running ? <LabButton variant="destructive" className="run-button" onClick={onStop}><Square /> 停止模拟</LabButton> : <LabButton className="run-button" disabled={!online} onClick={onStart}><Play /> 开始本地模拟</LabButton>}
+        <div className="config-group"><span>客户端数量</span><div className="preset-buttons">{[1, 10, 50, 100].map((value) => <button key={value} className={clients === value ? 'active' : ''} disabled={controlsLocked} onClick={() => setClients(value)}>{value}</button>)}</div></div>
+        <LabField className="number-config" label="每客户端请求数" htmlFor="requests-per-client"><Input id="requests-per-client" type="number" min="10" max="1000" value={requestsPerClient} disabled={controlsLocked} onChange={(event) => setRequestsPerClient(Math.max(10, Number(event.target.value) || 10))} /></LabField>
+        <div className="config-group"><span>访问模式</span><div className="segmented">{(['READ_HEAVY', 'MIXED', 'WRITE_HEAVY'] as Workload[]).map((item) => <button key={item} className={workload === item ? 'active' : ''} disabled={controlsLocked} onClick={() => setWorkload(item)}>{item === 'READ_HEAVY' ? 'Read' : item === 'WRITE_HEAVY' ? 'Write' : 'Mixed'}</button>)}</div></div>
+        {running ? <LabButton variant="destructive" className="run-button" onClick={onStop}><Square /> 停止实验</LabButton> : <LabButton className="run-button" disabled={!online || stopping} onClick={onStart}>{stopping ? <Activity /> : <Play />} {stopping ? '正在停止后端…' : backendMode ? '开始并发实验' : '测试并发动画'}</LabButton>}
       </LabPanel>
 
       <LabPanel className="client-grid-card">
-        <LabPanelHeader icon={<Network size={15} />} eyebrow="客户端活动矩阵 · 前端本地模拟" title={`${clients} 个虚拟客户端并行工作`} action={<LabBadge variant="experiment" tone={status === 'IDLE' ? 'idle' : status === 'RUNNING' ? 'running' : status === 'COMPLETED' ? 'completed' : 'stopped'}>{status === 'IDLE' ? '准备就绪' : status === 'RUNNING' ? '模拟中' : status === 'COMPLETED' ? '模拟完成' : status === 'INTERRUPTED' ? '已中断' : '已停止'}</LabBadge>} />
+        <LabPanelHeader icon={<Network size={15} />} eyebrow={`客户端活动矩阵 · ${backendMode ? '后端实验' : '纯前端动画'}`} title={`${clients} 个${backendMode ? '客户端' : '虚拟客户端'}同时工作`} action={<LabBadge variant="experiment" tone={status === 'IDLE' ? 'idle' : status === 'RUNNING' ? 'running' : status === 'COMPLETED' ? 'completed' : 'stopped'}>{status === 'IDLE' ? '准备就绪' : status === 'RUNNING' ? '运行中' : status === 'COMPLETED' ? '校验完成' : status === 'INTERRUPTED' ? '已中断' : '已停止'}</LabBadge>} />
         <div className="client-legend"><span><i className="read" />读取</span><span><i className="write" />写入</span><span><i className="delete" />删除</span><span><i className="idle" />等待</span></div>
         <div className={`client-grid ${running ? 'is-running' : ''}`} style={{ gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))` }}>
           {renderedClients.map((index) => {
@@ -505,18 +630,18 @@ function ConcurrencyPage({
         </div>
         <div className="sample-stream secondary-detail">
           <span>请求采样</span>
-          <code>Client {Math.max(1, Math.min(clients, Math.floor(progress / 2) + 1))} → {workload === '写入为主' ? 'SET' : progress % 3 === 0 ? 'GET' : 'SET'} lab:key:{Math.floor(progress * 1.7)} → SUCCESS</code>
+          <code>Client {Math.max(1, Math.min(clients, Math.floor(progress / 2) + 1))} → {workload === 'WRITE_HEAVY' ? 'SET' : progress % 3 === 0 ? 'GET' : 'SET'} lab:key:{Math.floor(progress * 1.7)} → SUCCESS</code>
         </div>
       </LabPanel>
 
       <LabPanel className="concurrency-result">
         <LabPanelHeader icon={<Gauge size={15} />} eyebrow="实时结果" title="请求完成情况" />
         <div className="progress-ring" style={{ '--progress': `${progress * 3.6}deg` } as CSSProperties}><div><strong>{Math.round(progress)}%</strong><span>{formatNumber(currentCompleted)} / {formatNumber(total)}</span></div></div>
-        <div className="result-kpis"><div><span>成功</span><strong className="success-text">{formatNumber(successful)}</strong></div><div><span>失败</span><strong className={failed ? 'danger-text' : ''}>{formatNumber(failed)}</strong></div><div><span>模拟吞吐</span><strong>{formatNumber(throughput)}<small> 请求/秒</small></strong></div><div><span>已用时间</span><strong>{elapsed.toFixed(1)}<small> 秒</small></strong></div></div>
+        <div className="result-kpis"><div><span>总请求</span><strong>{formatNumber(total)}</strong></div><div><span>已完成</span><strong>{formatNumber(currentCompleted)}</strong></div><div><span>Success</span><strong className="success-text">{formatNumber(successful)}</strong></div><div><span>Failed</span><strong className={failed ? 'danger-text' : ''}>{formatNumber(failed)}</strong></div></div>
         <LabProgress value={progress} className="experiment-progress" />
-        <div className={`verdict-strip ${status === 'COMPLETED' ? 'pass' : status === 'STOPPED' || status === 'INTERRUPTED' ? 'stopped' : ''}`}>
-          {status === 'COMPLETED' ? <CheckCircle2 /> : status === 'STOPPED' || status === 'INTERRUPTED' ? <Pause /> : <Activity />}
-          <div><strong>{status === 'COMPLETED' ? '本地并发流程模拟完成' : status === 'STOPPED' ? '模拟已手动停止' : status === 'INTERRUPTED' ? '服务离线，模拟已中断' : running ? '虚拟请求正在执行' : online ? '参数就绪，等待开始' : '服务离线，无法开始'}</strong><span>{status === 'COMPLETED' ? '结果仅用于展示前端流程，不代表真实并发测试结论。' : status === 'INTERRUPTED' ? '已完成统计会保留，模拟服务恢复后可重新运行。' : '运行中可以切换页面，前端状态不会丢失。'}</span></div>
+        <div className={`verdict-strip ${status === 'COMPLETED' ? (passed ? 'pass' : 'fail') : status === 'STOPPED' || status === 'INTERRUPTED' ? 'stopped' : ''}`}>
+          {status === 'COMPLETED' ? (passed ? <CheckCircle2 /> : <CircleAlert />) : status === 'STOPPED' || status === 'INTERRUPTED' ? <Pause /> : <Activity />}
+          <div><strong>{status === 'COMPLETED' ? (passed ? 'CONCURRENCY PASS' : 'CONCURRENCY FAIL') : status === 'STOPPED' ? '实验已手动停止 · 未判定' : status === 'INTERRUPTED' ? '服务离线，实验中断 · 未判定' : running ? '多个客户端正在并发执行' : online ? '参数就绪，等待开始' : '服务离线，无法开始'}</strong><span>{status === 'COMPLETED' ? (backendMode ? '所有请求完成后才给出正确性结论；本页不评价吞吐性能。' : '纯前端模式只验证 UI、进度与 PASS / FAIL 动画。') : status === 'INTERRUPTED' ? '已完成统计会保留，恢复服务后可重新运行。' : '本页只证明并发访问结果正确，性能对比统一在性能实验室进行。'}</span></div>
         </div>
       </LabPanel>
     </section>
@@ -524,6 +649,7 @@ function ConcurrencyPage({
 }
 
 function RecoveryPage({
+  backendMode,
   serverState,
   phase,
   seedCount,
@@ -539,14 +665,14 @@ function RecoveryPage({
   afterFingerprint,
   sampleBefore,
   currentEntries,
+  verificationEntries,
+  walReplayCount,
+  recoveryTime,
   onSeed,
   onKill,
   onRestart,
-  compactRunning,
-  compactProgress,
-  compactResult,
-  onCompact,
 }: {
+  backendMode: boolean;
   serverState: ServerState;
   phase: RecoveryPhase;
   seedCount: number;
@@ -562,21 +688,21 @@ function RecoveryPage({
   afterFingerprint: string;
   sampleBefore: KvEntry[];
   currentEntries: KvEntry[];
+  verificationEntries: KvEntry[];
+  walReplayCount: number | null;
+  recoveryTime: number;
   onSeed: () => void;
   onKill: () => void;
   onRestart: () => void;
-  compactRunning: boolean;
-  compactProgress: number;
-  compactResult: CompactResult | null;
-  onCompact: () => void;
 }) {
   const phaseIndex = phase === 'IDLE' ? 0 : phase === 'PREPARED' ? 1 : phase === 'CRASHED' ? 2 : phase === 'RECOVERING' ? 3 : 4;
   const verified = phase === 'VERIFIED';
-  const pass = verified && recoveryLost === 0 && beforeFingerprint === afterFingerprint;
+  const samplesMatch = sampleBefore.every((sample) => verificationEntries.find((entry) => entry.key === sample.key)?.value === sample.value);
+  const pass = verified && beforeCount > 0 && recoveredCount === beforeCount && verificationEntries.length === beforeCount && recoveryLost === 0 && beforeFingerprint === afterFingerprint && samplesMatch;
   const offline = serverState === 'OFFLINE';
   const steps = ['准备数据', '强制断电', '重启服务', 'WAL 重放', '自动校验'];
-  const beforeDisplay = beforeCount || currentEntries.length;
-  const afterDisplay = verified ? currentEntries.length : phase === 'RECOVERING' ? recoveredCount : phase === 'CRASHED' ? 0 : '—';
+  const beforeDisplay: number | string = beforeCount || '—';
+  const afterDisplay = verified ? recoveredCount : phase === 'RECOVERING' ? recoveredCount : phase === 'CRASHED' ? 0 : '—';
 
   return (
     <section className={`recovery-page lab-page ${offline ? 'power-cut-mode' : ''}`}>
@@ -585,249 +711,336 @@ function RecoveryPage({
       </div>
 
       <LabPanel className="recovery-control">
-        <LabPanelHeader icon={<ShieldAlert size={15} />} eyebrow="断电实验控制 · 前端本地模拟" title="切换状态，再演示恢复流程" action={<LabStatusPill tone={serverState === 'ONLINE' ? 'online' : serverState === 'OFFLINE' ? 'offline' : 'warning'}>{serverLabels[serverState].label}</LabStatusPill>} />
+        <LabPanelHeader icon={<ShieldAlert size={15} />} eyebrow={`断电实验控制 · ${backendMode ? '后端进程' : '纯前端动画'}`} title="Seed → Kill → Restart → Verify" action={<LabStatusPill tone={serverState === 'ONLINE' ? 'online' : serverState === 'OFFLINE' ? 'offline' : 'warning'}>{serverLabels[serverState].label}</LabStatusPill>} />
         <div className="seed-presets"><span>准备演示数据</span><div>{[50, 100, 500, 1000].map((value) => <button key={value} className={seedCount === value ? 'active' : ''} disabled={serverState !== 'ONLINE' || phase === 'RECOVERING'} onClick={() => setSeedCount(value)}>{value} 键</button>)}</div></div>
-        <div className="failure-toggle"><div><strong>故障注入</strong><small>仅让恢复后的前端快照少 2 个键，用于展示 FAIL</small></div><Switch aria-label="故障注入" checked={injectFailure} onCheckedChange={setInjectFailure} disabled={phase === 'RECOVERING' || phase === 'CRASHED'} /></div>
+        <div className="failure-toggle"><div><strong>验证层故障注入</strong><small>只让 After 校验视图少 2 个键；不修改 WAL、Before Snapshot 或真实后端</small></div><Switch aria-label="验证层故障注入" checked={injectFailure} onCheckedChange={setInjectFailure} disabled={phase === 'RECOVERING' || phase === 'CRASHED'} /></div>
         <div className="recovery-actions">
-          <LabButton variant="secondary" disabled={serverState !== 'ONLINE' || phase === 'RECOVERING'} onClick={onSeed}><Database /> ① 写入本地快照</LabButton>
-          <LabButton variant="destructive" className="kill-button" disabled={phase !== 'PREPARED' || serverState !== 'ONLINE'} onClick={onKill}><Zap /> ② 模拟强制终止</LabButton>
-          <LabButton className="restart-button" disabled={phase !== 'CRASHED'} onClick={onRestart}><RefreshCcw /> ③ 模拟重启与重放</LabButton>
+          <LabButton variant="secondary" disabled={serverState !== 'ONLINE' || phase === 'RECOVERING'} onClick={onSeed}><Database /> ① Seed Data + Before</LabButton>
+          <LabButton variant="destructive" className="kill-button" disabled={phase !== 'PREPARED' || serverState !== 'ONLINE'} onClick={onKill}><Zap /> ② Kill Server</LabButton>
+          <LabButton className="restart-button" disabled={phase !== 'CRASHED'} onClick={onRestart}><RefreshCcw /> ③ Restart + WAL Replay</LabButton>
         </div>
-        <div className="power-explainer"><div className={serverState === 'OFFLINE' ? 'lost' : ''}><HardDrive /><span>页面内存中的键</span><strong>{serverState === 'OFFLINE' ? 0 : phase === 'RECOVERING' ? recoveredCount : currentEntries.length}</strong></div><ArrowRight /><div className="safe"><FileClock /><span>本地演示快照</span><strong>仍然保留 ✓</strong></div></div>
+        <div className="recovery-evidence">
+          <div className={serverState === 'OFFLINE' ? 'lost' : ''}><HardDrive /><span>Memory Store</span><strong>{serverState === 'OFFLINE' ? 0 : phase === 'RECOVERING' ? recoveredCount : currentEntries.length} Keys</strong><small>易失 · Kill 后清空</small></div>
+          <div className="wal-source"><FileClock /><span>WAL</span><strong>{phase === 'IDLE' ? '等待 Seed' : 'Preserved'}</strong><small>唯一恢复来源</small></div>
+          <div className="verify-only"><ListChecks /><span>Frontend Snapshot</span><strong>{beforeCount || '—'} Keys</strong><small>只用于 Before / After 校验</small></div>
+        </div>
       </LabPanel>
 
       <LabPanel className={`recovery-proof ${verified ? (pass ? 'proof-pass' : 'proof-fail') : ''}`}>
-        <LabPanelHeader icon={<ShieldCheck size={15} />} eyebrow="本地校验演示" title="恢复后的前端快照仍然一致吗？" action={verified ? <LabBadge variant="proof" tone={pass ? 'pass' : 'fail'}>{pass ? '模拟通过' : '发现不一致'}</LabBadge> : <LabBadge variant="proof" tone="waiting">等待实验</LabBadge>} />
-        <div className="before-after">
-          <div><span>崩溃前</span><strong>{formatNumber(beforeDisplay)}</strong><small>内存键</small></div>
-          <ArrowRight />
-          <div><span>重启后</span><strong>{typeof afterDisplay === 'number' ? formatNumber(afterDisplay) : afterDisplay}</strong><small>恢复键</small></div>
-          <div className={`lost-count ${verified && recoveryLost ? 'danger' : ''}`}><span>丢失</span><strong>{verified ? recoveryLost : '—'}</strong><small>键</small></div>
+        <LabPanelHeader icon={<ShieldCheck size={15} />} eyebrow="自动一致性校验" title="WAL 重建的 Memory 是否等于 Before？" action={verified ? <LabBadge variant="proof" tone={pass ? 'pass' : 'fail'}>{pass ? 'CONSISTENCY PASS' : 'CONSISTENCY FAIL'}</LabBadge> : <LabBadge variant="proof" tone="waiting">等待实验</LabBadge>} />
+        <div className="recovery-metrics">
+          <div><span>Before Keys</span><strong>{typeof beforeDisplay === 'number' ? formatNumber(beforeDisplay) : beforeDisplay}</strong><small>Frontend Snapshot</small></div>
+          <div><span>Recovered Keys</span><strong>{typeof afterDisplay === 'number' ? formatNumber(afterDisplay) : afterDisplay}</strong><small>Memory Store</small></div>
+          <div className={verified && recoveryLost ? 'danger' : ''}><span>Lost Keys</span><strong>{verified ? recoveryLost : '—'}</strong><small>Before − After</small></div>
+          <div><span>WAL Replay</span><strong>{walReplayCount === null ? '—' : formatNumber(walReplayCount)}</strong><small>{walReplayCount === null ? '等待接入层返回' : 'Records'}</small></div>
+          <div><span>Recovery Time</span><strong>{recoveryTime ? recoveryTime.toFixed(2) : '—'}</strong><small>Seconds</small></div>
+        </div>
+        <div className="hash-compare">
+          <span>Before / After Hash</span><code>{beforeFingerprint || '等待快照'}</code><ArrowRight /><code>{afterFingerprint || '等待恢复'}</code><em className={verified ? (beforeFingerprint === afterFingerprint ? 'pass' : 'fail') : ''}>{verified ? (beforeFingerprint === afterFingerprint ? 'MATCH' : 'MISMATCH') : 'WAITING'}</em>
         </div>
         <div className="integrity-checks">
-          <div><span>数据指纹</span><code>{beforeFingerprint || '等待快照'}</code><ArrowRight /><code>{afterFingerprint || '等待恢复'}</code><em className={verified ? (beforeFingerprint === afterFingerprint ? 'pass' : 'fail') : ''}>{verified ? (beforeFingerprint === afterFingerprint ? '一致' : '不一致') : '待校验'}</em></div>
           {sampleBefore.slice(0, 3).map((sample) => {
-            const after = currentEntries.find((entry) => entry.key === sample.key);
+            const after = verificationEntries.find((entry) => entry.key === sample.key);
             const same = verified && after?.value === sample.value;
             return <div key={sample.key}><span>抽样值</span><code>{sample.key}</code><ArrowRight /><code>{verified ? (after?.value ?? 'MISSING') : sample.value}</code><em className={verified ? (same ? 'pass' : 'fail') : ''}>{verified ? (same ? '正确' : '错误') : '待校验'}</em></div>;
           })}
         </div>
         <div className={`big-verdict ${verified ? (pass ? 'pass' : 'fail') : 'waiting'}`}>
           {verified ? (pass ? <CheckCircle2 /> : <CircleAlert />) : <ShieldCheck />}
-          <div><strong>{verified ? (pass ? '重启以后仍然对' : '重启以后发现不一致') : '等待重启后的自动比对'}</strong><span>{verified ? (pass ? `${formatNumber(beforeCount)} 个键全部恢复，抽样值与数据指纹完全一致。` : `发现 ${recoveryLost} 个键丢失，系统明确给出 FAIL，不掩盖问题。`) : '系统会同时比较键数量、抽样值和整体数据指纹。'}</span></div>
+          <div><strong>{verified ? (pass ? 'CONSISTENCY PASS' : 'CONSISTENCY FAIL') : '等待 Restart 后自动比对'}</strong><span>{verified ? (pass ? `${formatNumber(beforeCount)} 个键由 WAL 重建，数量、抽样值与 Hash 一致。` : `发现 ${recoveryLost} 个键丢失；Before Snapshot 只负责发现差异，从未参与恢复。`) : '恢复来源始终是 WAL；Frontend Verification Snapshot 只提供校验基线。'}</span></div>
         </div>
       </LabPanel>
 
       <LabPanel className="replay-panel">
-        <LabPanelHeader icon={<TerminalSquare size={15} />} eyebrow="WAL 重放动画" title="前端演示进度" action={<span className="replay-percent">{Math.round(progress)}%</span>} />
+        <LabPanelHeader icon={<TerminalSquare size={15} />} eyebrow={`WAL Replay · ${backendMode ? '恢复过程' : 'UI 动画'}`} title="从 WAL 重建 Memory Store" action={<span className="replay-percent">{Math.round(progress)}%</span>} />
         <LabProgress value={progress} className="replay-progress" />
-        <div className="replay-counter"><span>已恢复</span><strong>{formatNumber(phase === 'RECOVERING' ? recoveredCount : verified ? currentEntries.length : 0)}</strong><small>/ {formatNumber(beforeDisplay)} 键</small></div>
+        <div className="replay-counter"><span>已恢复</span><strong>{formatNumber(phase === 'RECOVERING' ? recoveredCount : verified ? currentEntries.length : 0)}</strong><small>/ {typeof beforeDisplay === 'number' ? formatNumber(beforeDisplay) : beforeDisplay} 键</small></div>
         <div className="replay-log">
-          {logs.length ? logs.slice(-7).map((log, index) => <code key={`${log}-${index}`}><span>{String(index + 1).padStart(2, '0')}</span>{log}</code>) : <div className="empty-log">运行断电实验后，这里会逐条显示恢复过程。</div>}
+          {logs.length ? logs.slice(-9).map((log, index) => <code key={`${log}-${index}`}><span>{String(index + 1).padStart(2, '0')}</span>{log}</code>) : <div className="empty-log">运行断电实验后，这里会逐条显示 WAL Replay 过程。</div>}
         </div>
-      </LabPanel>
-
-      <LabPanel className="compact-panel">
-        <LabPanelHeader icon={<FileClock size={15} />} eyebrow="WAL 压缩 · 扩展预留" title="前端本地模拟，不修改真实文件" action={<LabButton variant="outline" disabled={compactRunning || serverState !== 'ONLINE'} onClick={onCompact}>{compactRunning ? <Activity /> : <Sparkles />}{compactRunning ? '正在模拟' : '模拟 Compact'}</LabButton>} />
-        <div className="compact-compare">
-          <div><span>压缩前</span><strong>{formatNumber(compactResult?.beforeRecords ?? INITIAL_WAL_RECORDS)} 条</strong><i><b style={{ width: '92%' }} /></i><small>{formatBytes(compactResult?.beforeBytes ?? INITIAL_WAL_BYTES)}</small></div>
-          <ArrowRight />
-          <div><span>压缩后</span><strong>{compactResult ? formatNumber(compactResult.afterRecords) : '—'} 条</strong><i><b className="after" style={{ width: compactResult ? `${Math.max(7, (compactResult.afterBytes / compactResult.beforeBytes) * 100)}%` : '7%' }} /></i><small>{compactResult ? formatBytes(compactResult.afterBytes) : '等待执行'}</small></div>
-        </div>
-        <div className="compact-progress"><LabProgress value={compactProgress} /><span>{compactRunning ? `模拟构建快照与原子替换 · ${Math.round(compactProgress)}%` : compactResult ? `模拟体积减少 ${Math.round((1 - compactResult.afterBytes / compactResult.beforeBytes) * 100)}% · 前端流程完成` : '本地模拟：Build → Flush/Sync → Replace → Verify'}</span></div>
       </LabPanel>
     </section>
   );
 }
 
 function PerformancePage({
+  backendMode,
   online,
+  mode,
+  setMode,
+  researchVariable,
+  setResearchVariable,
+  runtime,
+  setRuntime,
+  lock,
+  setLock,
   scales,
   setScales,
   workload,
   setWorkload,
+  preset,
+  onApplyPreset,
   status,
   progress,
-  results,
+  series,
+  currentJob,
+  stage,
+  environmentResets,
+  stopping,
   onStart,
   onStop,
+  onRetry,
 }: {
+  backendMode: boolean;
   online: boolean;
+  mode: ExperimentMode;
+  setMode: (value: ExperimentMode) => void;
+  researchVariable: ResearchVariable;
+  setResearchVariable: (value: ResearchVariable) => void;
+  runtime: RuntimeModel;
+  setRuntime: (value: RuntimeModel) => void;
+  lock: LockStrategy;
+  setLock: (value: LockStrategy) => void;
   scales: number[];
   setScales: (value: number[]) => void;
   workload: Workload;
   setWorkload: (value: Workload) => void;
+  preset: BenchmarkPreset;
+  onApplyPreset: (value: Exclude<BenchmarkPreset, null>) => void;
   status: ExperimentStatus;
   progress: number;
-  results: BenchmarkPoint[];
+  series: BenchmarkSeries[];
+  currentJob: BenchmarkJob | null;
+  stage: string;
+  environmentResets: number;
+  stopping: boolean;
   onStart: () => void;
   onStop: () => void;
+  onRetry: () => void;
 }) {
   const running = status === 'RUNNING';
-  const peak = results.length ? results.reduce((best, point) => point.qps > best.qps ? point : best, results[0]) : null;
-  const bestP99 = results.length ? Math.min(...results.map((point) => point.p99)) : 0;
+  const controlsLocked = running || stopping;
   const toggleScale = (scale: number) => setScales(scales.includes(scale) ? scales.filter((value) => value !== scale) : [...scales, scale].sort((a, b) => a - b));
+  const baseConfig = useMemo<BenchmarkConfig>(() => ({ runtime, lock, workload, requests: BENCHMARK_REQUESTS }), [runtime, lock, workload]);
+  const previewSeries = useMemo(() => buildBenchmarkSeries(mode, researchVariable, baseConfig, scales), [mode, researchVariable, baseConfig, scales]);
+  const displayedSeries = series.length ? series : previewSeries;
+  const runScales = useMemo(() => {
+    if (!series.length) return scales;
+    return Array.from(new Set(series.flatMap((item) => Object.keys(item.scaleStatus).map(Number)))).sort((a, b) => a - b);
+  }, [series, scales]);
+  const allPoints = series.flatMap((item) => item.points.map((point) => ({ ...point, seriesId: item.id, seriesLabel: item.label })));
+  const hasFailedScale = series.some((item) => Object.values(item.scaleStatus).includes('FAILED'));
+  const hasWaitingScale = series.some((item) => Object.values(item.scaleStatus).includes('WAITING'));
+  const canResume = !running && (status === 'STOPPED' || status === 'INTERRUPTED') && (hasFailedScale || hasWaitingScale);
+  const completedSteps = series.reduce((count, item) => count + Object.values(item.scaleStatus).filter((value) => value === 'DONE').length, 0);
+  const totalSteps = series.reduce((count, item) => count + Object.keys(item.scaleStatus).length, 0);
+
+  const chartData = useMemo(() => runScales.map((clients) => {
+    const row: Record<string, number> = { clients };
+    for (const item of series) {
+      const point = item.points.find((candidate) => candidate.clients === clients);
+      if (!point) continue;
+      row[`${item.id}Qps`] = point.qps;
+      row[`${item.id}P50`] = point.p50;
+      row[`${item.id}P95`] = point.p95;
+      row[`${item.id}P99`] = point.p99;
+    }
+    return row;
+  }), [runScales, series]);
+
+  const throughputConfig = useMemo(() => Object.fromEntries(series.map((item, index) => [
+    `${item.id}Qps`,
+    { label: item.label, color: LAB_BENCHMARK_SERIES_COLORS[index] },
+  ])) as ChartConfig, [series]);
+  const latencyConfig = useMemo(() => Object.fromEntries(series.flatMap((item, index) => ([
+    [`${item.id}P50`, { label: `${item.label} · P50`, color: LAB_BENCHMARK_SERIES_COLORS[index] }],
+    [`${item.id}P95`, { label: `${item.label} · P95`, color: LAB_BENCHMARK_SERIES_COLORS[index] }],
+    [`${item.id}P99`, { label: `${item.label} · P99`, color: LAB_BENCHMARK_SERIES_COLORS[index] }],
+  ]))) as ChartConfig, [series]);
+
+  const peakMarker = allPoints.length ? allPoints.reduce((best, point) => point.qps > best.qps ? point : best, allPoints[0]) : null;
+  const turningMarker = series.flatMap((item) => {
+    const ordered = [...item.points].sort((a, b) => a.clients - b.clients);
+    const index = ordered.findIndex((point, pointIndex) => pointIndex > 0 && point.qps < ordered[pointIndex - 1].qps);
+    return index > 0 ? [{ ...ordered[index], seriesId: item.id, seriesLabel: item.label }] : [];
+  })[0] ?? null;
+  const maxDifferenceMarker = mode === 'COMPARE' && series.length > 1
+    ? runScales.map((clients) => {
+        const points = series.map((item) => item.points.find((point) => point.clients === clients)).filter((point): point is BenchmarkPoint => Boolean(point));
+        if (points.length < 2) return null;
+        const max = Math.max(...points.map((point) => point.qps));
+        const min = Math.min(...points.map((point) => point.qps));
+        return { clients, qps: max, gap: max - min };
+      }).filter((value): value is { clients: number; qps: number; gap: number } => Boolean(value)).reduce<{ clients: number; qps: number; gap: number } | null>((best, value) => !best || value.gap > best.gap ? value : best, null)
+    : null;
+
+  const commonScales = runScales.filter((scale) => series.length > 0 && series.every((item) => item.points.some((point) => point.clients === scale)));
+  const summaryScale = commonScales.length ? Math.max(...commonScales) : null;
+  const summaryPoints = summaryScale === null ? [] : series.map((item) => ({ item, point: item.points.find((point) => point.clients === summaryScale)! }));
+  const controlSummary = summaryPoints[0];
+  const comparisonSummaries = summaryPoints.slice(1).map((entry) => ({
+    ...entry,
+    qpsDelta: percentageChange(controlSummary.point.qps, entry.point.qps),
+    p99Delta: percentageChange(controlSummary.point.p99, entry.point.p99),
+  }));
+  const primaryComparison = comparisonSummaries[comparisonSummaries.length - 1] ?? null;
+
+  const fixedConditionText = series.length
+    ? [
+        researchVariable !== 'RUNTIME' || mode === 'SINGLE' ? series[0].config.runtime : null,
+        researchVariable !== 'LOCK' || mode === 'SINGLE' ? series[0].config.lock : null,
+        researchVariable !== 'WORKLOAD' || mode === 'SINGLE' ? workloadMeta[series[0].config.workload].label : null,
+        `${formatNumber(series[0].config.requests)} Requests`,
+      ].filter(Boolean).join(' · ')
+    : '等待运行';
+
+  let conclusion = '完成至少一个可比较的客户端规模后，系统会根据当前结果生成结论。';
+  if (mode === 'SINGLE' && peakMarker) {
+    conclusion = `本轮 ${peakMarker.seriesLabel} 在 ${peakMarker.clients} Clients 达到当前最高吞吐 ${formatNumber(peakMarker.qps)} req/s；该结论只描述本轮已收集数据。`;
+  } else if (comparisonSummaries.length && summaryScale !== null) {
+    const findings = comparisonSummaries.map((comparison) => {
+      const throughputDirection = comparison.qpsDelta > 0 ? '更高' : comparison.qpsDelta < 0 ? '更低' : '相同';
+      const latencyDirection = comparison.p99Delta < 0 ? '降低' : comparison.p99Delta > 0 ? '升高' : '不变';
+      const mixedDirection = comparison.qpsDelta > 0 && comparison.p99Delta < 0
+        ? '同时提高吞吐并降低尾延迟'
+        : comparison.qpsDelta < 0 && comparison.p99Delta > 0
+          ? '吞吐下降且尾延迟升高'
+          : '吞吐与尾延迟方向不一致';
+      return `${comparison.item.label} 的吞吐${throughputDirection}、P99 ${latencyDirection}，相对 ${controlSummary.item.label} ${mixedDirection}`;
+    });
+    conclusion = `在 ${summaryScale} Clients 下，${findings.join('；')}。`;
+  }
+
+  const sourceLabel = backendMode ? '后端实测结果' : '本地实验执行器 · 非实测';
 
   return (
     <section className="performance-page lab-page">
       <LabPanel className="benchmark-config">
-        <div><span className="panel-kicker"><Gauge size={15} /> 性能演示参数</span><h2>生成不同并发规模下的前端演示数据</h2></div>
-        <div className="config-group"><span>并发规模</span><div className="preset-buttons">{[1, 10, 50, 100].map((value) => <button key={value} className={scales.includes(value) ? 'active' : ''} disabled={running} onClick={() => toggleScale(value)}>{value}</button>)}</div></div>
-        <div className="config-group"><span>负载类型</span><div className="segmented">{(['读取为主', '写入为主', '混合读写'] as Workload[]).map((item) => <button key={item} className={workload === item ? 'active' : ''} disabled={running} onClick={() => setWorkload(item)}>{item}</button>)}</div></div>
-        <div className="request-summary"><span>每组虚拟请求</span><strong>10,000</strong><small>约 4 秒演示</small></div>
-        {running ? <LabButton variant="destructive" onClick={onStop}><Pause /> 停止并保留结果</LabButton> : <LabButton disabled={!online || !scales.length} onClick={onStart}><Play /> 运行本地模拟</LabButton>}
+        <div className="benchmark-config-heading">
+          <div><span className="panel-kicker"><Gauge size={15} /> 可控变量性能实验室</span><h2>固定条件 → 改变一个变量 → 自动运行 → 比较结果</h2></div>
+          <span className={`experiment-source ${backendMode ? 'measured' : ''}`}>{sourceLabel}</span>
+        </div>
+        <div className="experiment-mode" aria-label="实验方式"><span>实验方式</span><div><button type="button" className={mode === 'SINGLE' ? 'active' : ''} disabled={controlsLocked} aria-pressed={mode === 'SINGLE'} onClick={() => setMode('SINGLE')}>单次实验</button><button type="button" className={mode === 'COMPARE' ? 'active' : ''} disabled={controlsLocked} aria-pressed={mode === 'COMPARE'} onClick={() => setMode('COMPARE')}>对照实验</button></div></div>
+        {mode === 'COMPARE' && <fieldset className="research-variable" disabled={controlsLocked}><legend>研究变量</legend>{(['RUNTIME', 'LOCK', 'WORKLOAD'] as ResearchVariable[]).map((value) => <label key={value}><input type="radio" name="research-variable" checked={researchVariable === value} onChange={() => setResearchVariable(value)} /><span>{researchVariableLabels[value]}</span></label>)}</fieldset>}
+        <div className="parameter-grid">
+          <fieldset disabled={controlsLocked || mode === 'COMPARE' && researchVariable === 'RUNTIME'}><legend>并发模型</legend>{(['Sync', 'Async'] as RuntimeModel[]).map((value) => <label key={value} aria-label={`${value} 并发模型`}><input type="radio" name="runtime-model" checked={runtime === value} onChange={() => setRuntime(value)} /><span><b>{value}</b><small>{value === 'Sync' ? 'Thread-per-connection' : 'Tokio Runtime'}</small></span></label>)}{mode === 'COMPARE' && researchVariable === 'RUNTIME' && <em>自动比较 Sync / Async</em>}</fieldset>
+          <fieldset disabled={controlsLocked || mode === 'COMPARE' && researchVariable === 'LOCK'}><legend>锁策略</legend>{(['Mutex', 'RwLock'] as LockStrategy[]).map((value) => <label key={value} aria-label={`${value} 锁策略`}><input type="radio" name="lock-strategy" checked={lock === value} onChange={() => setLock(value)} /><span><b>{value}</b><small>{value === 'Mutex' ? '互斥访问' : '并发读 / 排他写'}</small></span></label>)}{mode === 'COMPARE' && researchVariable === 'LOCK' && <em>自动比较 Mutex / RwLock</em>}</fieldset>
+          <fieldset className="workload-fieldset" disabled={controlsLocked || mode === 'COMPARE' && researchVariable === 'WORKLOAD'}><legend>Workload</legend>{(['READ_HEAVY', 'MIXED', 'WRITE_HEAVY'] as Workload[]).map((value) => <label key={value} aria-label={`${workloadMeta[value].label} ${workloadMeta[value].ratio}`}><input type="radio" name="performance-workload" checked={workload === value} onChange={() => setWorkload(value)} /><span><b>{workloadMeta[value].label}</b><small>{workloadMeta[value].ratio}</small></span></label>)}{mode === 'COMPARE' && researchVariable === 'WORKLOAD' && <em>自动比较三种工作负载</em>}</fieldset>
+          <div className="scale-selector"><span>Clients</span><div>{BENCHMARK_SCALES.map((value) => <button key={value} type="button" className={scales.includes(value) ? 'active' : ''} disabled={controlsLocked} aria-pressed={scales.includes(value)} onClick={() => toggleScale(value)}>{value}</button>)}</div><small>按 1 → 10 → 50 → 100 顺序执行</small></div>
+          <div className="request-summary"><span>Requests / Scale</span><strong>{formatNumber(BENCHMARK_REQUESTS)}</strong><small>每组条件保持一致</small></div>
+        </div>
+        <div className="benchmark-actions">
+          <p>{backendMode ? '答辩模式会调用接入层并收集实测 QPS 与延迟分位。' : '纯前端模式只测试实验流程、动画、失败与重试，不代表 RustKV 性能。'}</p>
+          {canResume && <LabButton variant="outline" onClick={onRetry} disabled={!online || stopping}><RefreshCcw /> {hasFailedScale ? 'Retry Failed Scale' : '继续未完成 Scale'}</LabButton>}
+          {running ? <LabButton variant="destructive" onClick={onStop}><Pause /> 停止并保留结果</LabButton> : <LabButton disabled={!online || !scales.length || stopping} onClick={onStart}>{stopping ? <Activity /> : <Play />} {stopping ? '正在停止后端…' : mode === 'COMPARE' ? '运行对照实验' : '运行单次实验'}</LabButton>}
+        </div>
       </LabPanel>
 
-      <div className="benchmark-kpis">
-        <div><span>模拟峰值吞吐</span><strong>{peak ? formatNumber(peak.qps) : '—'}<small> 请求/秒</small></strong><em>{peak ? `${peak.clients} 客户端` : '暂无数据'}</em></div>
-        <div><span>并发甜点</span><strong>{peak?.clients ?? '—'}<small> 客户端</small></strong><em>吞吐最高点</em></div>
-        <div><span>最低 P99</span><strong>{bestP99 ? bestP99.toFixed(1) : '—'}<small> ms</small></strong><em>尾延迟</em></div>
-        <div><span>成功率</span><strong>{results.length ? Math.min(...results.map((point) => point.success)).toFixed(2) : '—'}<small>%</small></strong><em>{status === 'INTERRUPTED' ? '测试被中断' : '所有已完成规模'}</em></div>
-        <div className="benchmark-progress"><span>{running ? '模拟进行中' : status === 'COMPLETED' ? '模拟完成' : status === 'INTERRUPTED' ? '已保留完成点' : '等待运行'}</span><strong>{Math.round(progress)}%</strong><LabProgress value={progress} /></div>
-      </div>
+      <LabPanel className="experiment-presets">
+        <LabPanelHeader icon={<Sparkles size={15} />} eyebrow="答辩预设" title="一键装载标准控制变量实验" />
+        <div className="preset-cards">
+          <button type="button" className={preset === 'A' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('A')}><span>A</span><div><strong>Sync vs Async</strong><small>固定 Mutex · Mixed · 全部 Clients</small></div></button>
+          <button type="button" className={preset === 'B' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('B')}><span>B</span><div><strong>Mutex vs RwLock</strong><small>固定 Sync · Read Heavy · 全部 Clients</small></div></button>
+          <button type="button" className={preset === 'C' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('C')}><span>C</span><div><strong>Workload Comparison</strong><small>固定 Async · RwLock · 全部 Clients</small></div></button>
+        </div>
+        <p>RwLock 的潜在优势主要来自并发读；Write Heavy 下不保证优于 Mutex。</p>
+      </LabPanel>
+
+      <LabPanel className="fixed-conditions">
+        <LabPanelHeader icon={<ListChecks size={15} />} eyebrow="Fixed Conditions" title="所有对照组共享同一实验条件" action={<span className="prototype-label">WAL / sync_data 不可切换</span>} />
+        <div><span>Dataset Size</span><strong>10,000 Keys</strong></div><div><span>Value Size</span><strong>128 B</strong></div><div><span>Requests / Scale</span><strong>10,000</strong></div><div><span>Persistence</span><strong>WAL + sync_data</strong></div><div><span>Protocol</span><strong>JSON Lines</strong></div><div><span>Network</span><strong>Localhost</strong></div>
+      </LabPanel>
+
+      <LabPanel className="scale-runner" aria-live="polite">
+        <LabPanelHeader icon={<Activity size={15} />} eyebrow="执行序列" title={stage || '等待运行实验'} action={<div className="runner-progress"><span>{completedSteps} / {totalSteps || displayedSeries.length * scales.length} Steps</span><strong>{Math.round(progress)}%</strong></div>} />
+        <div className="scale-series-list">
+          {displayedSeries.map((item, seriesIndex) => <div key={item.id} className="scale-series-row"><div className="series-identity"><i style={{ background: LAB_BENCHMARK_SERIES_COLORS[seriesIndex] }} /><span><strong>{item.label}</strong><small>{item.role}</small></span></div>{runScales.map((scale) => {
+            const scaleStatus = item.scaleStatus[scale] ?? 'WAITING';
+            return <div key={scale} className={`scale-state ${scaleStatus.toLowerCase()}`}><span>{scale}</span>{scaleStatus === 'DONE' ? <CheckCircle2 /> : scaleStatus === 'RUNNING' ? <Activity /> : scaleStatus === 'FAILED' ? <CircleAlert /> : <i />}<small>{scaleStatus}</small></div>;
+          })}</div>)}
+        </div>
+        <div className="runner-footer"><span>{currentJob ? `当前：${series.find((item) => item.id === currentJob.seriesId)?.label ?? currentJob.seriesId} · ${currentJob.clients} Clients` : status === 'COMPLETED' ? '全部规模已完成' : status === 'INTERRUPTED' ? '失败点已标记，可单独重试' : status === 'STOPPED' ? '已完成点保留，可继续未完成 Scale' : '运行 A 完成后恢复相同数据环境，再运行 B / C'}</span><span>Environment Resets <b>{environmentResets}</b></span><LabProgress value={progress} /></div>
+      </LabPanel>
 
       <LabPanel className="throughput-chart-card">
-        <LabPanelHeader icon={<Activity size={15} />} eyebrow="吞吐量 · 前端本地模拟" title="客户端数量 vs 每秒请求数" action={<span className="prototype-label">非实测数据</span>} />
-        {results.length ? (
-          <ChartContainer config={throughputChartConfig} className="benchmark-chart" initialDimension={{ width: 640, height: 270 }}>
-            <BarChart data={results} margin={{ top: 18, right: 12, bottom: 0, left: 0 }}>
+        <LabPanelHeader icon={<Activity size={15} />} eyebrow="Clients vs Throughput" title="吞吐量随客户端数变化" action={<span className="prototype-label">{sourceLabel}</span>} />
+        {allPoints.length ? (
+          <ChartContainer config={throughputConfig} className="benchmark-chart" initialDimension={{ width: 640, height: 300 }} aria-label="客户端数量与吞吐量对照图">
+            <LineChart data={chartData} margin={{ top: 28, right: 22, bottom: 4, left: 2 }}>
               <CartesianGrid vertical={false} stroke="#202b36" strokeDasharray="3 5" />
-              <XAxis dataKey="clients" tickLine={false} axisLine={false} tickFormatter={(value) => `${value} 客户端`} />
+              <XAxis dataKey="clients" tickLine={false} axisLine={false} tickFormatter={(value) => `${value}C`} />
               <YAxis tickLine={false} axisLine={false} width={42} />
-              <ChartTooltip cursor={{ fill: 'rgba(36,217,143,.05)' }} content={<ChartTooltipContent indicator="line" />} />
-              <Bar dataKey="qps" fill="var(--color-qps)" radius={[5, 5, 0, 0]} />
-            </BarChart>
+              <ChartTooltip content={<ChartTooltipContent indicator="line" />} />
+              <Legend iconType="circle" iconSize={7} />
+              {series.map((item) => <Line key={item.id} type="monotone" dataKey={`${item.id}Qps`} stroke={`var(--color-${item.id}Qps)`} strokeWidth={2.4} connectNulls={false} dot={{ r: 3 }} />)}
+              {peakMarker && <ReferenceDot x={peakMarker.clients} y={peakMarker.qps} r={4} fill="var(--primary)" stroke="var(--background)" label={{ value: 'Peak', position: 'top', fill: 'var(--muted-foreground)', fontSize: 8 }} />}
+              {turningMarker && <ReferenceDot x={turningMarker.clients} y={turningMarker.qps} r={4} fill="var(--benchmark-turning)" stroke="var(--background)" label={{ value: '拐点', position: 'right', fill: 'var(--muted-foreground)', fontSize: 8 }} />}
+              {maxDifferenceMarker && <ReferenceDot x={maxDifferenceMarker.clients} y={maxDifferenceMarker.qps} r={4} fill="var(--benchmark-difference)" stroke="var(--background)" label={{ value: '最大差异', position: 'left', fill: 'var(--muted-foreground)', fontSize: 8 }} />}
+            </LineChart>
           </ChartContainer>
-        ) : <div className="empty-state chart-empty"><Gauge /><strong>等待运行本地模拟</strong><p>每完成一个并发规模，演示数据点会立即出现。</p></div>}
+        ) : <div className="empty-state chart-empty"><Gauge /><strong>等待实验数据</strong><p>每完成一个 Scale，曲线会立即增加一个数据点。</p></div>}
+        <p className="chart-summary">标记整体 Peak、首个吞吐下降拐点，以及对照系列间最大差异点。</p>
       </LabPanel>
 
       <LabPanel className="latency-chart-card">
-        <LabPanelHeader icon={<Clock3 size={15} />} eyebrow="延迟分位 · 前端本地模拟" title="P50 / P95 / P99 尾延迟" action={<span className="latency-unit">单位：毫秒</span>} />
-        {results.length ? (
-          <ChartContainer config={latencyChartConfig} className="benchmark-chart" initialDimension={{ width: 540, height: 270 }}>
-            <LineChart data={results} margin={{ top: 18, right: 14, bottom: 0, left: 0 }}>
+        <LabPanelHeader icon={<Clock3 size={15} />} eyebrow="Clients vs Tail Latency" title="P50 / P95 / P99 延迟分位" action={<span className="latency-unit">P99 重点 · ms</span>} />
+        {allPoints.length ? (
+          <ChartContainer config={latencyConfig} className="benchmark-chart" initialDimension={{ width: 640, height: 300 }} aria-label="客户端数量与延迟分位对照图">
+            <LineChart data={chartData} margin={{ top: 28, right: 22, bottom: 4, left: 2 }}>
               <CartesianGrid vertical={false} stroke="#202b36" strokeDasharray="3 5" />
               <XAxis dataKey="clients" tickLine={false} axisLine={false} />
               <YAxis tickLine={false} axisLine={false} width={34} />
-              <ReferenceLine x={50} stroke="#2add9d" strokeDasharray="4 5" strokeOpacity={0.45} />
+              <ReferenceLine x={50} stroke="var(--primary)" strokeDasharray="4 5" strokeOpacity={0.24} />
               <ChartTooltip content={<ChartTooltipContent indicator="line" />} />
-              <Line type="monotone" dataKey="p50" stroke="var(--color-p50)" strokeWidth={2} dot={{ r: 3 }} />
-              <Line type="monotone" dataKey="p95" stroke="var(--color-p95)" strokeWidth={2} dot={{ r: 3 }} />
-              <Line type="monotone" dataKey="p99" stroke="var(--color-p99)" strokeWidth={2} dot={{ r: 3 }} />
+              <Legend iconType="line" />
+              {series.flatMap((item) => [
+                <Line key={`${item.id}-p50`} type="monotone" dataKey={`${item.id}P50`} stroke={`var(--color-${item.id}P50)`} strokeWidth={1} strokeOpacity={0.32} dot={false} connectNulls={false} />,
+                <Line key={`${item.id}-p95`} type="monotone" dataKey={`${item.id}P95`} stroke={`var(--color-${item.id}P95)`} strokeWidth={1.4} strokeOpacity={0.62} dot={false} connectNulls={false} />,
+                <Line key={`${item.id}-p99`} type="monotone" dataKey={`${item.id}P99`} stroke={`var(--color-${item.id}P99)`} strokeWidth={2.6} dot={{ r: 3 }} connectNulls={false} />,
+              ])}
             </LineChart>
           </ChartContainer>
-        ) : <div className="empty-state chart-empty"><Clock3 /><strong>等待延迟样本</strong><p>已完成的数据不会因中途停止而清空。</p></div>}
+        ) : <div className="empty-state chart-empty"><Clock3 /><strong>等待延迟样本</strong><p>P99 使用更粗线条；已完成点不会因后续失败而清空。</p></div>}
+        <p className="chart-summary">P50 / P95 使用辅助线，P99 使用主线，便于观察尾延迟退化。</p>
       </LabPanel>
 
-      <LabPanel className="workload-insight">
-        <LabPanelHeader icon={<Sparkles size={15} />} eyebrow="结果解读" title="只解读本次已生成的数据点" action={<span className="prototype-label">非后端结论</span>} />
-        {results.length ? <div className="insight-flow">{results.map((point) => <div key={point.clients} className={point.clients === peak?.clients ? 'best' : ''}><span>{point.clients} 客户端</span><i style={{ width: `${Math.max(8, point.qps / (peak?.qps ?? point.qps) * 88)}%` }} /><small>{point.clients === peak?.clients ? '模拟峰值' : `P99 ${point.p99.toFixed(1)} ms`}</small></div>)}</div> : <div className="empty-state"><Sparkles /><strong>暂无可解读结果</strong><p>运行本地模拟后再生成结论。</p></div>}
-        <p>{results.length ? '这些数值由前端模板生成，只用于验证图表、停止与保留结果等交互，不代表真实 RustKV 性能。' : '本页不会在未运行时展示预置结果，也不会把模拟值标成实测。'}</p>
-      </LabPanel>
-    </section>
-  );
-}
-
-function PubSubPage({
-  online,
-  subscribers,
-  channel,
-  setChannel,
-  message,
-  setMessage,
-  publishing,
-  logs,
-  onPublish,
-  onAddSubscriber,
-  onToggleSubscriber,
-}: {
-  online: boolean;
-  subscribers: Subscriber[];
-  channel: string;
-  setChannel: (value: string) => void;
-  message: string;
-  setMessage: (value: string) => void;
-  publishing: boolean;
-  logs: string[];
-  onPublish: () => void;
-  onAddSubscriber: () => void;
-  onToggleSubscriber: (id: number) => void;
-}) {
-  const activeCount = subscribers.filter((subscriber) => subscriber.active).length;
-  return (
-    <section className="pubsub-page lab-page">
-      <LabPanel className="pubsub-stage">
-        <LabPanelHeader icon={<Radio size={15} />} eyebrow="发布订阅实验区" title="一条消息，推送给多个订阅者" action={<span className="prototype-label">前端本地模拟 · 扩展预留</span>} />
-        <div className={`message-stage ${publishing ? 'is-publishing' : ''}`}>
-          <div className="subscriber-zone">
-            <div className="zone-title"><span>订阅者</span><LabButton variant="ghost" size="sm" onClick={onAddSubscriber} disabled={!online || publishing || subscribers.length >= 4}><Plus /> 添加</LabButton></div>
-            {subscribers.map((subscriber) => (
-              <div key={subscriber.id} className={`subscriber-card ${subscriber.active && online ? 'listening' : 'disconnected'}`}>
-                <div><Bell /><span><strong>{subscriber.name}</strong><small>{subscriber.active && online ? `正在监听 #${channel}` : online ? '已取消订阅' : '连接已断开'}</small></span></div>
-                <LabButton variant="ghost" size="xs" disabled={!online || publishing} onClick={() => onToggleSubscriber(subscriber.id)}>{subscriber.active ? '取消' : '订阅'}</LabButton>
-                <p>{subscriber.received[0] ? `收到：“${subscriber.received[0]}”` : '等待第一条消息…'}</p>
-              </div>
-            ))}
-          </div>
-
-          <div className="broker-zone">
-            <div className={`broker-node ${online ? 'online' : 'offline'}`}><Server /><strong>RustKV Broker（模拟）</strong><span>{online ? '正在演示消息路由' : '服务离线'}</span><code>#{channel}</code></div>
-            <div className="broker-lines"><i /><i /><i /></div>
-            {publishing && <div className="flying-message"><MessageSquare /><span>{message}</span></div>}
-          </div>
-
-          <div className="publisher-zone">
-            <span className="zone-label">发布者</span>
-            <div className="publisher-card"><Send /><strong>消息发布面板</strong><small>Publisher → Broker → Subscribers</small></div>
-          <LabField label="频道 Channel" htmlFor="pubsub-channel"><Input id="pubsub-channel" value={channel} disabled={!online || publishing} onChange={(event) => setChannel(event.target.value.replace(/\s/g, ''))} placeholder="news" /></LabField>
-          <LabField label="消息 Message" htmlFor="pubsub-message"><Input id="pubsub-message" value={message} disabled={!online || publishing} onChange={(event) => setMessage(event.target.value)} placeholder="Hello Rust" /></LabField>
-          <LabButton className="publish-button" disabled={!online || publishing || !message.trim() || !channel.trim()} onClick={onPublish}><Send /> {publishing ? '正在推送…' : '发布消息'}</LabButton>
-          </div>
-        </div>
-        <div className="delivery-summary"><div><span>当前频道</span><strong>#{channel || '—'}</strong></div><ArrowRight /><div><span>在线订阅者</span><strong>{online ? activeCount : 0}</strong></div><ArrowRight /><div><span>投递语义</span><strong>一对多推送</strong></div></div>
+      <LabPanel className="comparison-summary">
+        <LabPanelHeader icon={<ListChecks size={15} />} eyebrow="对照结果摘要" title={summaryScale === null ? '等待同规模结果配对' : `${summaryScale} Clients · 控制变量比较`} action={<span className="prototype-label">{sourceLabel}</span>} />
+        {summaryPoints.length ? <>
+          <div className="summary-series-cards">{summaryPoints.map(({ item, point }, index) => <div key={item.id}><span><i style={{ background: LAB_BENCHMARK_SERIES_COLORS[index] }} />{item.role}</span><strong>{item.label}</strong><dl><div><dt>Throughput</dt><dd>{formatNumber(point.qps)} <small>req/s</small></dd></div><div><dt>P50</dt><dd>{point.p50.toFixed(2)} ms</dd></div><div><dt>P95</dt><dd>{point.p95.toFixed(2)} ms</dd></div><div><dt>P99</dt><dd>{point.p99.toFixed(2)} ms</dd></div></dl></div>)}</div>
+          {comparisonSummaries.length > 0 && <div className="delta-strips">{comparisonSummaries.map((entry) => <div key={entry.item.id}><span>{entry.item.label} vs {controlSummary.item.label}</span><strong>Throughput {formatSignedPercentage(entry.qpsDelta)}</strong><strong className={entry.p99Delta <= 0 ? 'good' : 'bad'}>P99 {formatSignedPercentage(entry.p99Delta)}</strong></div>)}</div>}
+        </> : <div className="empty-state"><ListChecks /><strong>暂无完整对照</strong><p>A/B 在同一 Clients 规模完成后才计算百分比，缺失值不会用 0 代替。</p></div>}
       </LabPanel>
 
-      <LabPanel className="pubsub-log">
-        <LabPanelHeader icon={<TerminalSquare size={15} />} eyebrow="事件日志" title="消息流转记录" action={<LabStatusPill tone={online ? 'online' : 'offline'}>{online ? '已连接' : '已断开'}</LabStatusPill>} />
-        <div className="event-log">{logs.slice(-9).map((log, index) => <code key={`${log}-${index}`}><span>{String(index + 1).padStart(2, '0')}</span>{log}</code>)}</div>
-        <div className="pubsub-compare"><div><Database /><span><strong>传统 KV</strong><small>客户端发起请求，服务端返回响应</small></span></div><div><Radio /><span><strong>发布订阅</strong><small>服务端主动把一条消息推给多个订阅者</small></span></div></div>
+      <LabPanel className="experiment-conclusion">
+        <LabPanelHeader icon={<Sparkles size={15} />} eyebrow="实验结论" title="只根据本轮已收集结果生成" action={<span className="prototype-label">{sourceLabel}</span>} />
+        <div className="conclusion-facts"><div><span>研究变量</span><strong>{mode === 'SINGLE' ? '单次配置' : researchVariableLabels[researchVariable]}</strong></div><div><span>对照组</span><strong>{series[0]?.label ?? '—'}</strong></div><div><span>实验组</span><strong>{series.slice(1).map((item) => item.label).join(' / ') || '—'}</strong></div><div><span>固定条件</span><strong>{fixedConditionText}</strong></div></div>
+        {primaryComparison && controlSummary && <div className="conclusion-deltas"><div><span>Throughput</span><strong>{formatNumber(controlSummary.point.qps)} → {formatNumber(primaryComparison.point.qps)}</strong><em className={primaryComparison.qpsDelta >= 0 ? 'good' : 'bad'}>{formatSignedPercentage(primaryComparison.qpsDelta)}</em></div><div><span>P99</span><strong>{controlSummary.point.p99.toFixed(2)} ms → {primaryComparison.point.p99.toFixed(2)} ms</strong><em className={primaryComparison.p99Delta <= 0 ? 'good' : 'bad'}>{formatSignedPercentage(primaryComparison.p99Delta)}</em></div></div>}
+        <blockquote>{conclusion}</blockquote>
+        <div className="workload-paths"><div><span>GET</span><code>Memory Read</code></div><ArrowRight /><div><span>SET</span><code>Exclusive Write → WAL → flush → sync_data → Memory Update</code></div></div>
       </LabPanel>
     </section>
   );
-}
-
-function makeBenchmarkData(workload: Workload): BenchmarkPoint[] {
-  const qpsFactor = workload === '读取为主' ? 1.14 : workload === '写入为主' ? 0.76 : 1;
-  const latencyFactor = workload === '读取为主' ? 0.82 : workload === '写入为主' ? 1.36 : 1;
-  return simulationBenchmarkTemplate.map((point) => ({
-    ...point,
-    qps: Math.round(point.qps * qpsFactor),
-    p50: Number((point.p50 * latencyFactor).toFixed(2)),
-    p95: Number((point.p95 * latencyFactor).toFixed(2)),
-    p99: Number((point.p99 * latencyFactor).toFixed(2)),
-  }));
 }
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<TabId>('overview');
-  const [demoMode, setDemoMode] = useState(false);
+  const [backendMode, setBackendMode] = useState(false);
+  const [backendProbeEpoch, setBackendProbeEpoch] = useState(0);
   const [resetOpen, setResetOpen] = useState(false);
   const [serverState, setServerState] = useState<ServerState>('ONLINE');
   const [lastUpdate, setLastUpdate] = useState('刚刚');
   const [entries, setEntries] = useState<KvEntry[]>(makeInitialEntries);
-  const [walRecords, setWalRecords] = useState(INITIAL_WAL_RECORDS);
-  const [walBytes, setWalBytes] = useState(INITIAL_WAL_BYTES);
   const [operations, setOperations] = useState<OperationLog[]>(initialOperations);
 
   const [concurrencyClients, setConcurrencyClients] = useState(100);
   const [requestsPerClient, setRequestsPerClient] = useState(100);
-  const [concurrencyWorkload, setConcurrencyWorkload] = useState<Workload>('混合读写');
+  const [concurrencyWorkload, setConcurrencyWorkload] = useState<Workload>('MIXED');
   const [concurrencyStatus, setConcurrencyStatus] = useState<ExperimentStatus>('IDLE');
   const [concurrencyProgress, setConcurrencyProgress] = useState(0);
   const [concurrencySuccessful, setConcurrencySuccessful] = useState(0);
   const [concurrencyFailed, setConcurrencyFailed] = useState(0);
-  const [concurrencyThroughput, setConcurrencyThroughput] = useState(0);
-  const [concurrencyElapsed, setConcurrencyElapsed] = useState(0);
+  const [concurrencyStopping, setConcurrencyStopping] = useState(false);
 
   const [recoveryPhase, setRecoveryPhase] = useState<RecoveryPhase>('IDLE');
   const [recoverySeedCount, setRecoverySeedCount] = useState(100);
@@ -840,33 +1053,44 @@ export default function Home() {
   const [beforeFingerprint, setBeforeFingerprint] = useState('');
   const [afterFingerprint, setAfterFingerprint] = useState('');
   const [recoverySamples, setRecoverySamples] = useState<KvEntry[]>([]);
-  const [compactRunning, setCompactRunning] = useState(false);
-  const [compactProgress, setCompactProgress] = useState(0);
-  const [compactResult, setCompactResult] = useState<CompactResult | null>(null);
+  const [recoveryVerificationEntries, setRecoveryVerificationEntries] = useState<KvEntry[]>([]);
+  const [walReplayCount, setWalReplayCount] = useState<number | null>(0);
+  const [recoveryTime, setRecoveryTime] = useState(0);
 
-  const [benchmarkScales, setBenchmarkScales] = useState([1, 10, 50, 100]);
-  const [benchmarkWorkload, setBenchmarkWorkload] = useState<Workload>('混合读写');
+  const [benchmarkMode, setBenchmarkMode] = useState<ExperimentMode>('COMPARE');
+  const [benchmarkResearchVariable, setBenchmarkResearchVariable] = useState<ResearchVariable>('LOCK');
+  const [benchmarkRuntime, setBenchmarkRuntime] = useState<RuntimeModel>('Sync');
+  const [benchmarkLock, setBenchmarkLock] = useState<LockStrategy>('Mutex');
+  const [benchmarkScales, setBenchmarkScales] = useState<number[]>([...BENCHMARK_SCALES]);
+  const [benchmarkWorkload, setBenchmarkWorkload] = useState<Workload>('READ_HEAVY');
+  const [benchmarkPreset, setBenchmarkPreset] = useState<BenchmarkPreset>('B');
   const [benchmarkStatus, setBenchmarkStatus] = useState<ExperimentStatus>('IDLE');
   const [benchmarkProgress, setBenchmarkProgress] = useState(0);
-  const [benchmarkResults, setBenchmarkResults] = useState<BenchmarkPoint[]>([]);
-
-  const [subscribers, setSubscribers] = useState<Subscriber[]>([
-    { id: 1, name: 'Subscriber A', active: true, received: [] },
-    { id: 2, name: 'Subscriber B', active: true, received: [] },
-    { id: 3, name: 'Subscriber C', active: false, received: [] },
-  ]);
-  const [pubsubChannel, setPubsubChannel] = useState('news');
-  const [pubsubMessage, setPubsubMessage] = useState('Hello Rust');
-  const [publishing, setPublishing] = useState(false);
-  const [pubsubLogs, setPubsubLogs] = useState(['[READY] 发布订阅原型已就绪', '[SUB] Subscriber A → #news', '[SUB] Subscriber B → #news']);
+  const [benchmarkSeries, setBenchmarkSeries] = useState<BenchmarkSeries[]>([]);
+  const [benchmarkCurrentJob, setBenchmarkCurrentJob] = useState<BenchmarkJob | null>(null);
+  const [benchmarkStage, setBenchmarkStage] = useState('等待运行实验');
+  const [benchmarkEnvironmentResets, setBenchmarkEnvironmentResets] = useState(0);
+  const [benchmarkStopping, setBenchmarkStopping] = useState(false);
 
   const logIdRef = useRef(0);
   const concurrencyTimerRef = useRef<number | null>(null);
   const recoveryTimerRef = useRef<number | null>(null);
-  const compactTimerRef = useRef<number | null>(null);
   const benchmarkTimerRef = useRef<number | null>(null);
-  const publishTimerRef = useRef<number | null>(null);
   const recoverySnapshotRef = useRef<KvEntry[]>([]);
+  const recoveryWalRef = useRef<KvEntry[]>([]);
+  const backendFailureCountRef = useRef(0);
+  const lifecycleEpochRef = useRef(0);
+  const concurrencyRunRef = useRef(0);
+  const concurrencyRunningRef = useRef(false);
+  const recoveryRunRef = useRef(0);
+  const benchmarkRunRef = useRef(0);
+  const benchmarkRunningRef = useRef(false);
+  const suspendHealthProbeRef = useRef(false);
+  const benchmarkQueueRef = useRef<BenchmarkJob[]>([]);
+  const benchmarkSeriesRef = useRef<BenchmarkSeries[]>([]);
+  const benchmarkCurrentJobRef = useRef<BenchmarkJob | null>(null);
+  const benchmarkCompletedRef = useRef(0);
+  const benchmarkTotalRef = useRef(0);
 
   const clearTimer = (timerRef: { current: number | null }) => {
     if (timerRef.current !== null) window.clearInterval(timerRef.current);
@@ -880,18 +1104,76 @@ export default function Home() {
     setLastUpdate(formatClock().slice(0, 8));
   }, []);
 
+  const refreshBackendEntries = useCallback(async () => {
+    const keysResponse = await sendKvCommand({ cmd: 'keys' });
+    if (keysResponse.kind !== 'keys') throw new RustKvApiError('INVALID_RESPONSE', 'keys 响应类型不匹配');
+    const loaded: KvEntry[] = [];
+    for (let start = 0; start < keysResponse.keys.length; start += 24) {
+      const chunk = keysResponse.keys.slice(start, start + 24);
+      const values = await Promise.all(chunk.map(async (key) => {
+        const response = await sendKvCommand({ cmd: 'get', key });
+        if (response.kind !== 'get') throw new RustKvApiError('INVALID_RESPONSE', 'get 响应类型不匹配');
+        return { key, value: response.value };
+      }));
+      loaded.push(...values);
+    }
+    return loaded;
+  }, []);
+
   useEffect(() => () => {
     clearTimer(concurrencyTimerRef);
     clearTimer(recoveryTimerRef);
-    clearTimer(compactTimerRef);
     clearTimer(benchmarkTimerRef);
-    if (publishTimerRef.current !== null) window.clearTimeout(publishTimerRef.current);
   }, []);
 
-  const performKvAction = (action: KvAction, key: string, value: string): KvResult => {
+  useEffect(() => {
+    if (!backendMode) {
+      backendFailureCountRef.current = 0;
+      return;
+    }
+    const epoch = lifecycleEpochRef.current;
+    let cancelled = false;
+    let loadedInitialStore = false;
+    let probing = false;
+    const probe = async () => {
+      if (suspendHealthProbeRef.current || probing) return;
+      probing = true;
+      try {
+        const response = await sendKvCommand({ cmd: 'ping' });
+        if (response.kind !== 'ping') throw new RustKvApiError('INVALID_RESPONSE', 'ping 响应类型不匹配');
+        if (cancelled || epoch !== lifecycleEpochRef.current || suspendHealthProbeRef.current) return;
+        backendFailureCountRef.current = 0;
+        setServerState('ONLINE');
+        setLastUpdate('刚刚');
+        if (!loadedInitialStore) {
+          const loaded = await refreshBackendEntries();
+          if (cancelled || epoch !== lifecycleEpochRef.current || suspendHealthProbeRef.current) return;
+          setEntries(loaded);
+          loadedInitialStore = true;
+        }
+      } catch {
+        if (cancelled || epoch !== lifecycleEpochRef.current || suspendHealthProbeRef.current) return;
+        backendFailureCountRef.current += 1;
+        if (backendFailureCountRef.current >= 3) {
+          setServerState('OFFLINE');
+          setLastUpdate(formatClock().slice(0, 8));
+        }
+      } finally {
+        probing = false;
+      }
+    };
+    void probe();
+    const healthTimer = window.setInterval(() => void probe(), 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(healthTimer);
+    };
+  }, [backendMode, backendProbeEpoch, refreshBackendEntries]);
+
+  const performKvAction = async (action: KvAction, key: string, value: string): Promise<KvResult> => {
     if (serverState !== 'ONLINE') {
       addOperation(action, key || '(empty)', 'error', '连接失败', '—');
-      return { kind: 'error', title: '连接失败', message: 'RustKV 服务当前离线。请先在“崩溃恢复”页面重启服务。' };
+      return { kind: 'error', title: '连接失败', message: backendMode ? 'RustKV 后端当前离线。请先在“崩溃恢复”页面重启服务。' : '前端测试状态已离线，请先在“崩溃恢复”页面恢复。' };
     }
     if (action !== 'KEYS') {
       const keyError = validateKey(key);
@@ -902,6 +1184,60 @@ export default function Home() {
     }
     const normalizedKey = key;
     const existing = entries.find((entry) => entry.key === normalizedKey);
+    const startedAt = performance.now();
+
+    if (backendMode) {
+      const requestEpoch = lifecycleEpochRef.current;
+      const staleResult: KvResult = { kind: 'info', title: '请求已取消', message: '执行模式或实验状态已变化，迟到响应不会写回当前界面。' };
+      const isStale = () => requestEpoch !== lifecycleEpochRef.current;
+      try {
+        if (action === 'SET') {
+          const valueError = validateValue(value);
+          if (valueError) {
+            addOperation('SET', normalizedKey, 'error', valueError.title, '—');
+            return valueError;
+          }
+          const response = await sendKvCommand({ cmd: 'set', key: normalizedKey, value });
+          if (isStale()) return staleResult;
+          if (response.kind !== 'set') throw new RustKvApiError('INVALID_RESPONSE', 'set 响应类型不匹配');
+          setEntries((previous) => response.replaced ? previous.map((entry) => entry.key === normalizedKey ? { key: normalizedKey, value } : entry) : [{ key: normalizedKey, value }, ...previous]);
+          const latency = `${(performance.now() - startedAt).toFixed(1)} ms`;
+          addOperation('SET', normalizedKey, 'write', response.replaced ? '后端已更新' : '后端已创建', latency);
+          return { kind: 'success', title: response.replaced ? '写入成功 · 已更新' : '写入成功 · 已创建', message: '后端成功响应表示 WAL、flush 与 sync_data 已完成。' };
+        }
+        if (action === 'GET') {
+          const response = await sendKvCommand({ cmd: 'get', key: normalizedKey });
+          if (isStale()) return staleResult;
+          if (response.kind !== 'get') throw new RustKvApiError('INVALID_RESPONSE', 'get 响应类型不匹配');
+          setEntries((previous) => previous.some((entry) => entry.key === normalizedKey) ? previous.map((entry) => entry.key === normalizedKey ? { key: normalizedKey, value: response.value } : entry) : [{ key: normalizedKey, value: response.value }, ...previous]);
+          const latency = `${(performance.now() - startedAt).toFixed(1)} ms`;
+          addOperation('GET', normalizedKey, 'read', '后端命中', latency);
+          return { kind: 'success', title: '后端读取成功', message: `返回 ${response.value.length} 个字符。`, value: response.value };
+        }
+        if (action === 'DELETE') {
+          const response = await sendKvCommand({ cmd: 'delete', key: normalizedKey });
+          if (isStale()) return staleResult;
+          if (response.kind !== 'delete') throw new RustKvApiError('INVALID_RESPONSE', 'delete 响应类型不匹配');
+          setEntries((previous) => previous.filter((entry) => entry.key !== normalizedKey));
+          const latency = `${(performance.now() - startedAt).toFixed(1)} ms`;
+          addOperation('DEL', normalizedKey, 'delete', '后端已删除', latency);
+          return { kind: 'success', title: '后端删除成功', message: '删除记录已持久化到 WAL。' };
+        }
+        const loaded = await refreshBackendEntries();
+        if (isStale()) return staleResult;
+        setEntries(loaded);
+        const latency = `${(performance.now() - startedAt).toFixed(1)} ms`;
+        addOperation('KEYS', '*', 'system', `${loaded.length} 个后端键`, latency);
+        return { kind: 'info', title: `共有 ${formatNumber(loaded.length)} 个后端键`, message: '已通过 KEYS + GET 刷新存储视图。' };
+      } catch (error) {
+        if (isStale()) return staleResult;
+        const apiError = error instanceof RustKvApiError ? error : new RustKvApiError('UNKNOWN', '未知请求错误');
+        if (apiError.code === 'BACKEND_UNREACHABLE' || apiError.code === 'TIMEOUT') setServerState('OFFLINE');
+        if (apiError.code === 'STORAGE_ERROR') setServerState('ERROR');
+        addOperation(action, normalizedKey || '*', 'error', apiError.code, `${(performance.now() - startedAt).toFixed(1)} ms`);
+        return { kind: 'error', title: `${apiError.code}`, message: apiError.message };
+      }
+    }
 
     if (action === 'SET') {
       const valueError = validateValue(value);
@@ -910,10 +1246,8 @@ export default function Home() {
         return valueError;
       }
       setEntries((previous) => existing ? previous.map((entry) => entry.key === normalizedKey ? { key: normalizedKey, value } : entry) : [{ key: normalizedKey, value }, ...previous]);
-      setWalRecords((count) => count + 1);
-      setWalBytes((bytes) => bytes + textEncoder.encode(normalizedKey).length + textEncoder.encode(value).length + 24);
       addOperation('SET', normalizedKey, 'write', existing ? '本地已更新' : '本地已创建', '—');
-      return { kind: 'success', title: existing ? '本地写入成功 · 已更新' : '本地写入成功 · 已创建', message: '浏览器内存中的键值已更新；本次未发送后端请求。' };
+      return { kind: 'success', title: existing ? '纯前端写入 · 已更新' : '纯前端写入 · 已创建', message: '仅更新浏览器内存，用于测试 CRUD 界面与动画。' };
     }
     if (action === 'GET') {
       if (!existing) {
@@ -929,248 +1263,673 @@ export default function Home() {
         return { kind: 'error', title: '删除失败 · 未找到', message: `键“${normalizedKey}”不存在，存储未发生变化。` };
       }
       setEntries((previous) => previous.filter((entry) => entry.key !== normalizedKey));
-      setWalRecords((count) => count + 1);
-      setWalBytes((bytes) => bytes + textEncoder.encode(normalizedKey).length + 18);
       addOperation('DEL', normalizedKey, 'delete', '本地删除', '—');
-      return { kind: 'success', title: '本地删除成功', message: '浏览器内存中的记录已删除；本次未修改真实 WAL。' };
+      return { kind: 'success', title: '纯前端删除成功', message: '浏览器内存中的记录已删除；未请求后端或修改 WAL。' };
     }
     addOperation('KEYS', '*', 'system', `${entries.length} 个本地键`, '—');
     return { kind: 'info', title: `共有 ${formatNumber(entries.length)} 个本地键`, message: '右侧存储视图已分页展示，可通过搜索快速定位。' };
   };
 
-  const startConcurrency = () => {
-    if (serverState !== 'ONLINE') return;
+  const startConcurrency = async () => {
+    if (serverState !== 'ONLINE' || concurrencyStopping) return;
     clearTimer(concurrencyTimerRef);
+    const epoch = lifecycleEpochRef.current;
+    const runId = ++concurrencyRunRef.current;
+    const isActiveRun = () => epoch === lifecycleEpochRef.current && runId === concurrencyRunRef.current;
     setConcurrencyStatus('RUNNING');
+    concurrencyRunningRef.current = true;
     setConcurrencyProgress(0);
     setConcurrencySuccessful(0);
     setConcurrencyFailed(0);
-    setConcurrencyThroughput(0);
-    setConcurrencyElapsed(0);
     const total = concurrencyClients * requestsPerClient;
-    const expectedThroughput = Math.round((concurrencyClients <= 50 ? 2200 + concurrencyClients * 205 : 12_450 - (concurrencyClients - 50) * 13) * (concurrencyWorkload === '读取为主' ? 1.12 : concurrencyWorkload === '写入为主' ? 0.78 : 1));
+
+    if (backendMode) {
+      try {
+        const startResponse = await startRemoteConcurrency({ clients: concurrencyClients, requestsPerClient, workload: workloadForApi(concurrencyWorkload) });
+        if (!isActiveRun()) return;
+        if (!startResponse.accepted) throw new RustKvApiError('NOT_ACCEPTED', '后端未接受并发实验');
+        let attempts = 0;
+        const poll = async () => {
+          if (!isActiveRun()) return;
+          try {
+            const state = await readRemoteConcurrency();
+            if (!isActiveRun()) return;
+            attempts += 1;
+            setConcurrencyProgress(state.progress);
+            setConcurrencySuccessful(state.successful);
+            setConcurrencyFailed(state.failed);
+            if (state.status === 'COMPLETED') {
+              clearTimer(concurrencyTimerRef);
+              concurrencyRunningRef.current = false;
+              setConcurrencyStatus('COMPLETED');
+              const passed = state.progress >= 100 && state.successful === total && state.failed === 0;
+              addOperation('LOAD', `${concurrencyClients} clients`, passed ? 'system' : 'error', passed ? 'CONCURRENCY PASS' : 'CONCURRENCY FAIL', '实测');
+              return;
+            }
+            if (state.status === 'INTERRUPTED' || state.status === 'STOPPED') {
+              clearTimer(concurrencyTimerRef);
+              concurrencyRunningRef.current = false;
+              setConcurrencyStatus(state.status);
+              return;
+            }
+            if (attempts >= 180) {
+              clearTimer(concurrencyTimerRef);
+              concurrencyRunningRef.current = false;
+              setConcurrencyStatus('INTERRUPTED');
+              addOperation('LOAD', `${concurrencyClients} clients`, 'error', '实验状态轮询超时 · 未判定', '—');
+              return;
+            }
+            concurrencyTimerRef.current = window.setTimeout(() => void poll(), 320);
+          } catch (error) {
+            if (!isActiveRun()) return;
+            clearTimer(concurrencyTimerRef);
+            concurrencyRunningRef.current = false;
+            setConcurrencyStatus('INTERRUPTED');
+            if (error instanceof RustKvApiError && (error.code === 'BACKEND_UNREACHABLE' || error.code === 'TIMEOUT')) setServerState('OFFLINE');
+          }
+        };
+        void poll();
+      } catch (error) {
+        if (!isActiveRun()) return;
+        concurrencyRunningRef.current = false;
+        setConcurrencyStatus('INTERRUPTED');
+        if (error instanceof RustKvApiError && (error.code === 'BACKEND_UNREACHABLE' || error.code === 'TIMEOUT')) setServerState('OFFLINE');
+      }
+      return;
+    }
+
     let step = 0;
     concurrencyTimerRef.current = window.setInterval(() => {
+      if (!isActiveRun()) return;
       step += 2.5;
       const nextProgress = Math.min(100, step);
       const completed = Math.round(total * nextProgress / 100);
       setConcurrencyProgress(nextProgress);
       setConcurrencySuccessful(completed);
-      setConcurrencyThroughput(Math.round(expectedThroughput * Math.min(1, 0.42 + nextProgress / 130)));
-      setConcurrencyElapsed(nextProgress * 0.038);
       if (nextProgress >= 100) {
         clearTimer(concurrencyTimerRef);
+        concurrencyRunningRef.current = false;
         setConcurrencyStatus('COMPLETED');
-        setConcurrencyThroughput(expectedThroughput);
-        addOperation('LOAD', `${concurrencyClients} virtual clients`, 'system', '本地模拟完成', '约 3.8s');
+        addOperation('LOAD', `${concurrencyClients} virtual clients`, 'system', 'CONCURRENCY PASS · UI 测试', '非实测');
       }
     }, 95);
   };
 
-  const stopConcurrency = () => {
+  const stopConcurrency = async () => {
+    if (concurrencyStopping) return;
+    const stopEpoch = lifecycleEpochRef.current;
     clearTimer(concurrencyTimerRef);
+    concurrencyRunRef.current += 1;
+    concurrencyRunningRef.current = false;
     setConcurrencyStatus('STOPPED');
-    addOperation('STOP', `${concurrencyClients} virtual clients`, 'system', '本地模拟已停止', '—');
+    setConcurrencyStopping(backendMode);
+    addOperation('STOP', `${concurrencyClients} ${backendMode ? 'clients' : 'virtual clients'}`, 'system', '实验已停止 · 未判定', '—');
+    if (backendMode) {
+      try {
+        const response = await stopRemoteConcurrency();
+        if (stopEpoch === lifecycleEpochRef.current && !response.stopped) addOperation('STOP', 'concurrency', 'error', '后端未确认停止', '—');
+      } catch {
+        if (stopEpoch === lifecycleEpochRef.current) addOperation('STOP', 'concurrency', 'error', '后端停止请求失败', '—');
+      } finally {
+        if (stopEpoch === lifecycleEpochRef.current) setConcurrencyStopping(false);
+      }
+    }
   };
 
-  const seedRecoveryData = () => {
+  const updateBenchmarkSeries = (updater: (current: BenchmarkSeries[]) => BenchmarkSeries[]) => {
+    const next = updater(benchmarkSeriesRef.current);
+    benchmarkSeriesRef.current = next;
+    setBenchmarkSeries(next);
+  };
+
+  const clearBenchmarkResultsForConfigChange = () => {
+    clearTimer(benchmarkTimerRef);
+    benchmarkRunRef.current += 1;
+    benchmarkRunningRef.current = false;
+    benchmarkQueueRef.current = [];
+    benchmarkSeriesRef.current = [];
+    benchmarkCurrentJobRef.current = null;
+    benchmarkCompletedRef.current = 0;
+    benchmarkTotalRef.current = 0;
+    setBenchmarkSeries([]);
+    setBenchmarkCurrentJob(null);
+    setBenchmarkStatus('IDLE');
+    setBenchmarkProgress(0);
+    setBenchmarkEnvironmentResets(0);
+    setBenchmarkStage('实验条件已更新，等待运行');
+  };
+
+  const interruptBenchmarkRun = (message: string) => {
+    clearTimer(benchmarkTimerRef);
+    benchmarkRunRef.current += 1;
+    benchmarkRunningRef.current = false;
+    const job = benchmarkCurrentJobRef.current;
+    if (job) {
+      updateBenchmarkSeries((current) => current.map((item) => item.id === job.seriesId ? { ...item, scaleStatus: { ...item.scaleStatus, [job.clients]: 'FAILED' } } : item));
+    }
+    benchmarkCurrentJobRef.current = null;
+    setBenchmarkCurrentJob(null);
+    setBenchmarkStatus('INTERRUPTED');
+    setBenchmarkStage(message);
+  };
+
+  const seedRecoveryData = async () => {
     if (serverState !== 'ONLINE') return;
-    const withoutOldSeed = entries.filter((entry) => !entry.key.startsWith('crash_test_'));
+    const epoch = lifecycleEpochRef.current;
+    const runId = ++recoveryRunRef.current;
+    const isActiveRun = () => epoch === lifecycleEpochRef.current && runId === recoveryRunRef.current;
     const seeded = Array.from({ length: recoverySeedCount }, (_, index) => ({
       key: `crash_test_${String(index + 1).padStart(4, '0')}`,
       value: `durable-value-${String((index * 17 + 11) % 997).padStart(3, '0')}`,
     }));
-    const next = [...seeded, ...withoutOldSeed];
+    let next: KvEntry[];
+    if (backendMode) {
+      setRecoveryLogs([`[SEED] 正在向后端写入 ${recoverySeedCount} 个测试键`]);
+      try {
+        const oldSeedKeys = entries.filter((entry) => entry.key.startsWith('crash_test_')).map((entry) => entry.key);
+        for (let start = 0; start < oldSeedKeys.length; start += 20) {
+          await Promise.all(oldSeedKeys.slice(start, start + 20).map((key) => sendKvCommand({ cmd: 'delete', key }).catch(() => null)));
+          if (!isActiveRun()) return;
+        }
+        for (let start = 0; start < seeded.length; start += 20) {
+          await Promise.all(seeded.slice(start, start + 20).map((entry) => sendKvCommand({ cmd: 'set', key: entry.key, value: entry.value })));
+          if (!isActiveRun()) return;
+        }
+        next = await refreshBackendEntries();
+      } catch (error) {
+        if (!isActiveRun()) return;
+        setRecoveryLogs([`[ERROR] ${error instanceof Error ? error.message : 'Seed Data 失败'}`]);
+        setServerState('ERROR');
+        return;
+      }
+    } else {
+      const withoutOldSeed = entries.filter((entry) => !entry.key.startsWith('crash_test_'));
+      next = [...seeded, ...withoutOldSeed];
+    }
+    if (!isActiveRun()) return;
     setEntries(next);
     recoverySnapshotRef.current = next.map((entry) => ({ ...entry }));
+    recoveryWalRef.current = next.map((entry) => ({ ...entry }));
     setRecoveryBeforeCount(next.length);
     setBeforeFingerprint(fingerprintFor(next));
     setAfterFingerprint('');
     setRecoverySamples(seeded.slice(0, 3));
+    setRecoveryVerificationEntries([]);
     setRecoveredCount(0);
     setRecoveryLost(0);
     setRecoveryProgress(0);
+    setWalReplayCount(backendMode ? null : 0);
+    setRecoveryTime(0);
     setRecoveryPhase('PREPARED');
-    setRecoveryLogs([`[SEED] 写入 ${recoverySeedCount} 个本地测试键`, '[SIM] 未连接后端；以下为 WAL 流程演示', `[SNAPSHOT] 模拟崩溃前 ${next.length} 个键 · ${fingerprintFor(next)}`]);
-    setWalRecords((count) => count + recoverySeedCount);
-    setWalBytes((bytes) => bytes + recoverySeedCount * 64);
-    addOperation('SEED', `${recoverySeedCount} local keys`, 'write', '本地快照完成', '—');
+    setRecoveryLogs([
+      `[SEED] ${backendMode ? '后端' : '前端'}写入 ${recoverySeedCount} 个测试键`,
+      `[WAL] ${backendMode ? '写入成功响应确认持久化' : '独立模拟 WAL 已记录'} · ${next.length} keys`,
+      `[SNAPSHOT] Before 已冻结，仅用于校验 · ${fingerprintFor(next)}`,
+    ]);
+    addOperation('SEED', `${recoverySeedCount} keys`, 'write', backendMode ? '后端写入 + Before Snapshot' : '本地 WAL + Before Snapshot', '—');
   };
 
-  const killServer = () => {
+  const killServer = async () => {
     if (recoveryPhase !== 'PREPARED' || serverState !== 'ONLINE') return;
-    recoverySnapshotRef.current = entries.map((entry) => ({ ...entry }));
-    setRecoveryBeforeCount(entries.length);
-    setBeforeFingerprint(fingerprintFor(entries));
+    const concurrencyWasRunning = concurrencyRunningRef.current;
+    const benchmarkWasRunning = benchmarkRunningRef.current;
+    const concurrencyHadRemoteWork = concurrencyWasRunning || concurrencyStopping;
+    const benchmarkHadRemoteWork = benchmarkWasRunning || benchmarkStopping;
+    lifecycleEpochRef.current += 1;
+    const epoch = lifecycleEpochRef.current;
+    concurrencyRunRef.current += 1;
+    concurrencyRunningRef.current = false;
+    const runId = ++recoveryRunRef.current;
+    const isActiveRun = () => epoch === lifecycleEpochRef.current && runId === recoveryRunRef.current;
+    setConcurrencyStopping(false);
+    setBenchmarkStopping(false);
+    if (backendMode) setBackendProbeEpoch((value) => value + 1);
+    suspendHealthProbeRef.current = true;
+    if (concurrencyWasRunning) {
+      clearTimer(concurrencyTimerRef);
+      setConcurrencyStatus('INTERRUPTED');
+      addOperation('STOP', `${concurrencyClients} clients`, 'error', 'Crash Recovery 接管 · 未判定', '—');
+    }
+    if (benchmarkWasRunning) interruptBenchmarkRun('当前 Scale 因 Crash Recovery 中断；已完成数据保留');
+    if (backendMode) {
+      try {
+        await killRemoteServer();
+      } catch (error) {
+        if (!isActiveRun()) return;
+        const pendingStops: Promise<unknown>[] = [];
+        if (concurrencyHadRemoteWork) pendingStops.push(stopRemoteConcurrency());
+        if (benchmarkHadRemoteWork) pendingStops.push(stopRemoteBenchmark());
+        if (pendingStops.length) await Promise.allSettled(pendingStops);
+        if (!isActiveRun()) return;
+        suspendHealthProbeRef.current = false;
+        setRecoveryLogs((previous) => [...previous, `[ERROR] Kill Server 失败 · ${error instanceof Error ? error.message : '未知错误'}`]);
+        return;
+      }
+    }
+    if (!isActiveRun()) return;
     setEntries([]);
     setServerState('OFFLINE');
     setRecoveryPhase('CRASHED');
     setRecoveredCount(0);
-    setRecoveryLogs((previous) => [...previous, '[KILL] 前端模拟服务状态切换为离线', '[MEMORY] 页面键集合已清空 · 0 keys', '[SNAPSHOT] 本地演示快照仍完整保留']);
+    setRecoveryLogs((previous) => [...previous, `[KILL] ${backendMode ? '后端进程已强制终止' : '前端服务动画切换为离线'}`, '[MEMORY] Memory Store 消失 · 0 Keys', '[WAL] WAL 保留，等待 Restart 后重放', '[SNAPSHOT] Frontend Snapshot 保留，但禁止作为恢复来源']);
     setLastUpdate(formatClock().slice(0, 8));
-    if (concurrencyStatus === 'RUNNING') {
-      clearTimer(concurrencyTimerRef);
-      setConcurrencyStatus('INTERRUPTED');
-      addOperation('STOP', `${concurrencyClients} virtual clients`, 'error', '离线中断', '—');
-    }
-    if (benchmarkStatus === 'RUNNING') {
-      clearTimer(benchmarkTimerRef);
-      setBenchmarkStatus('INTERRUPTED');
-    }
-    if (compactRunning) {
-      clearTimer(compactTimerRef);
-      setCompactRunning(false);
-    }
-    if (publishTimerRef.current !== null) {
-      window.clearTimeout(publishTimerRef.current);
-      publishTimerRef.current = null;
-      setPublishing(false);
-      setPubsubLogs((previous) => [...previous, '[STOP] 服务离线，发布演示已取消']);
-    }
-    addOperation('KILL', 'local demo state', 'error', '模拟离线', '—');
+    addOperation('KILL', backendMode ? 'managed server process' : 'frontend memory state', 'error', backendMode ? '后端已终止' : '纯前端动画', '—');
   };
 
-  const restartServer = () => {
+  const finalizeRecovery = (memoryEntries: KvEntry[], replayCount: number | null, elapsedSeconds: number) => {
+    const before = recoverySnapshotRef.current;
+    const verificationEntries = injectRecoveryFailure ? memoryEntries.slice(0, Math.max(0, memoryEntries.length - 2)) : memoryEntries;
+    const verificationMap = new Map(verificationEntries.map((entry) => [entry.key, entry.value]));
+    const lost = before.filter((entry) => verificationMap.get(entry.key) !== entry.value).length;
+    const afterHash = fingerprintFor(verificationEntries);
+    setEntries(memoryEntries);
+    setRecoveryVerificationEntries(verificationEntries);
+    setRecoveredCount(memoryEntries.length);
+    setRecoveryLost(lost);
+    setAfterFingerprint(afterHash);
+    setWalReplayCount(replayCount);
+    setRecoveryTime(elapsedSeconds);
+    setRecoveryProgress(100);
+    suspendHealthProbeRef.current = false;
+    setServerState('ONLINE');
+    setRecoveryPhase('VERIFIED');
+    setRecoveryLogs((previous) => [...previous, `[VERIFY] WAL 重建 Memory ${memoryEntries.length} Keys`, `[HASH] Before ${fingerprintFor(before)} · After ${afterHash}`, lost ? `[FAIL] 验证层检测到 ${lost} 个键不一致` : '[PASS] 数量、抽样值与 Hash 全部一致']);
+    setLastUpdate('刚刚');
+    addOperation('RESTART', backendMode ? 'backend WAL replay' : 'simulated WAL replay', lost ? 'error' : 'system', lost ? 'CONSISTENCY FAIL' : 'CONSISTENCY PASS', `${elapsedSeconds.toFixed(2)}s`);
+  };
+
+  const restartServer = async () => {
     if (recoveryPhase !== 'CRASHED') return;
     clearTimer(recoveryTimerRef);
+    const epoch = lifecycleEpochRef.current;
+    const runId = ++recoveryRunRef.current;
+    const isActiveRun = () => epoch === lifecycleEpochRef.current && runId === recoveryRunRef.current;
     setServerState('RECOVERING');
     setRecoveryPhase('RECOVERING');
     setRecoveryProgress(0);
-    setRecoveryLogs((previous) => [...previous, '[BOOT] 前端模拟进入恢复状态', '[OPEN] 读取本地演示快照', '[REPLAY] 开始播放 WAL 重放动画']);
-    const snapshot = recoverySnapshotRef.current.map((entry) => ({ ...entry }));
+    setWalReplayCount(backendMode ? null : 0);
+    setRecoveryLogs((previous) => [...previous, `[BOOT] ${backendMode ? '接入层正在重启后端进程' : '纯前端启动恢复动画'}`, '[SOURCE] 恢复来源 = WAL；Frontend Snapshot 未参与', '[REPLAY] 开始顺序重放 WAL']);
+    const startedAt = performance.now();
+
+    if (backendMode) {
+      try {
+        await restartRemoteServer();
+      } catch (error) {
+        if (!isActiveRun()) return;
+        setServerState('ERROR');
+        setRecoveryPhase('CRASHED');
+        setRecoveryLogs((previous) => [...previous, `[ERROR] Restart 失败 · ${error instanceof Error ? error.message : '未知错误'}`]);
+        return;
+      }
+      if (!isActiveRun()) return;
+      let attempts = 0;
+      let polling = false;
+      recoveryTimerRef.current = window.setInterval(async () => {
+        if (polling || !isActiveRun()) return;
+        polling = true;
+        attempts += 1;
+        try {
+          const remoteState = await readRemoteServerState();
+          if (!isActiveRun()) return;
+          setServerState(remoteState.state);
+          setRecoveryProgress((value) => Math.min(92, value + 5));
+          if (remoteState.state === 'ONLINE') {
+            const restored = await refreshBackendEntries();
+            if (!isActiveRun()) return;
+            clearTimer(recoveryTimerRef);
+            finalizeRecovery(restored, remoteState.walReplayCount ?? null, (performance.now() - startedAt) / 1000);
+          } else if (remoteState.state === 'ERROR' || attempts >= 80) {
+            clearTimer(recoveryTimerRef);
+            setServerState('ERROR');
+            setRecoveryPhase('CRASHED');
+            setRecoveryLogs((previous) => [...previous, '[ERROR] 恢复超时或 WAL 校验失败，请检查后端日志']);
+          }
+        } catch {
+          if (!isActiveRun()) return;
+          if (attempts >= 80) {
+            clearTimer(recoveryTimerRef);
+            setServerState('ERROR');
+            setRecoveryPhase('CRASHED');
+            setRecoveryLogs((previous) => [...previous, '[ERROR] 接入层在恢复时持续不可达']);
+          }
+        } finally {
+          polling = false;
+        }
+      }, 250);
+      return;
+    }
+
+    const wal = recoveryWalRef.current.map((entry) => ({ ...entry }));
     let step = 0;
     const announced = new Set<number>();
     recoveryTimerRef.current = window.setInterval(() => {
+      if (!isActiveRun()) return;
       step += 4;
       const nextProgress = Math.min(100, step);
-      const nextCount = Math.round(snapshot.length * nextProgress / 100);
+      const nextCount = Math.round(wal.length * nextProgress / 100);
       setRecoveryProgress(nextProgress);
       setRecoveredCount(nextCount);
+      setWalReplayCount(nextCount);
       [25, 50, 75].forEach((threshold) => {
         if (nextProgress >= threshold && !announced.has(threshold)) {
           announced.add(threshold);
-          setRecoveryLogs((previous) => [...previous, `[REPLAY] ${threshold}% · 已恢复 ${Math.round(snapshot.length * threshold / 100)} 个键`]);
+          setRecoveryLogs((previous) => [...previous, `[REPLAY] ${threshold}% · 已从 WAL 重建 ${Math.round(wal.length * threshold / 100)} 个键`]);
         }
       });
       if (nextProgress >= 100) {
         clearTimer(recoveryTimerRef);
-        const restored = injectRecoveryFailure ? snapshot.slice(0, Math.max(0, snapshot.length - 2)) : snapshot;
-        const lost = snapshot.length - restored.length;
-        setEntries(restored);
-        setRecoveredCount(restored.length);
-        setRecoveryLost(lost);
-        setAfterFingerprint(fingerprintFor(restored));
-        setServerState('ONLINE');
-        setRecoveryPhase('VERIFIED');
-        setRecoveryLogs((previous) => [...previous, `[VERIFY] 恢复 ${restored.length}/${snapshot.length} 个键`, `[HASH] ${fingerprintFor(restored)}`, lost ? `[FAIL] 检测到 ${lost} 个键丢失` : '[PASS] 数量、抽样值、数据指纹全部一致']);
-        setLastUpdate('刚刚');
-        addOperation('RESTART', 'local replay demo', lost ? 'error' : 'system', lost ? '模拟校验失败' : '模拟校验通过', '约 2.4s');
+        finalizeRecovery(wal, wal.length, (performance.now() - startedAt) / 1000);
       }
     }, 90);
   };
 
-  const runCompact = () => {
-    if (serverState !== 'ONLINE' || compactRunning) return;
-    clearTimer(compactTimerRef);
-    const before: CompactResult = { beforeRecords: walRecords, beforeBytes: walBytes, afterRecords: entries.length, afterBytes: Math.max(18 * 1024, entries.length * 62) };
-    setCompactRunning(true);
-    setCompactProgress(0);
-    setCompactResult(null);
-    let step = 0;
-    compactTimerRef.current = window.setInterval(() => {
-      step += 4;
-      setCompactProgress(Math.min(100, step));
-      if (step >= 100) {
-        clearTimer(compactTimerRef);
-        setCompactRunning(false);
-        setCompactResult(before);
-        setWalRecords(before.afterRecords);
-        setWalBytes(before.afterBytes);
-        addOperation('COMPACT', 'local demo', 'system', '模拟流程完成', '约 1.8s');
-      }
-    }, 70);
+  const failBenchmarkJob = (job: BenchmarkJob, message: string, runId: number, epoch: number) => {
+    if (runId !== benchmarkRunRef.current || epoch !== lifecycleEpochRef.current) return;
+    clearTimer(benchmarkTimerRef);
+    updateBenchmarkSeries((current) => current.map((item) => item.id === job.seriesId ? { ...item, scaleStatus: { ...item.scaleStatus, [job.clients]: 'FAILED' } } : item));
+    benchmarkCurrentJobRef.current = null;
+    setBenchmarkCurrentJob(null);
+    setBenchmarkStatus('INTERRUPTED');
+    benchmarkRunningRef.current = false;
+    setBenchmarkStage(message);
+    addOperation('BENCH', `${job.seriesId}:${job.clients}`, 'error', 'Scale FAILED · 可重试', '—');
+    benchmarkRunRef.current += 1;
   };
+
+  const resetBenchmarkEnvironmentBefore = (job: BenchmarkJob, runId: number, epoch: number, countReset: boolean, readyMessage: string) => {
+    void (async () => {
+      try {
+        const response = await resetRemoteBenchmarkEnvironment();
+        if (runId !== benchmarkRunRef.current || epoch !== lifecycleEpochRef.current) return;
+        if (!response.reset) {
+          failBenchmarkJob(job, '后端未确认实验环境复位；后续 Scale 未运行', runId, epoch);
+          return;
+        }
+        if (countReset) setBenchmarkEnvironmentResets((value) => value + 1);
+        setBenchmarkStage(readyMessage);
+        benchmarkTimerRef.current = window.setTimeout(() => runNextBenchmarkJob(runId, epoch), 120);
+      } catch (error) {
+        failBenchmarkJob(job, `实验环境复位失败 · ${error instanceof Error ? error.message : '未知错误'}`, runId, epoch);
+      }
+    })();
+  };
+
+  const completeBenchmarkJob = (job: BenchmarkJob, point: BenchmarkPoint, runId: number, epoch: number) => {
+    if (runId !== benchmarkRunRef.current || epoch !== lifecycleEpochRef.current) return;
+    if (!isValidBenchmarkPoint(point)) {
+      failBenchmarkJob(job, `${job.clients} Clients 返回无效数据；已完成点保留`, runId, epoch);
+      return;
+    }
+    updateBenchmarkSeries((current) => current.map((item) => {
+      if (item.id !== job.seriesId) return item;
+      const points = [...item.points.filter((candidate) => candidate.clients !== job.clients), point].sort((a, b) => a.clients - b.clients);
+      return { ...item, points, scaleStatus: { ...item.scaleStatus, [job.clients]: 'DONE' } };
+    }));
+    benchmarkCompletedRef.current += 1;
+    setBenchmarkProgress(benchmarkTotalRef.current ? benchmarkCompletedRef.current / benchmarkTotalRef.current * 100 : 100);
+    benchmarkCurrentJobRef.current = null;
+    setBenchmarkCurrentJob(null);
+
+    const next = benchmarkQueueRef.current[0];
+    if (!next) {
+      benchmarkRunningRef.current = false;
+      setBenchmarkStatus('COMPLETED');
+      setBenchmarkProgress(100);
+      setBenchmarkStage('全部 Scale 完成 · 已生成对照结论');
+      addOperation('BENCH', `${benchmarkTotalRef.current} steps`, 'system', backendMode ? '后端实测完成' : '本地执行器完成 · 非实测', '—');
+      return;
+    }
+    if (next.seriesId !== job.seriesId) {
+      setBenchmarkStage(backendMode ? '请求后端恢复相同数据集与持久化条件' : '恢复相同数据集与持久化条件，准备下一组');
+      if (!backendMode) {
+        setBenchmarkEnvironmentResets((value) => value + 1);
+        benchmarkTimerRef.current = window.setTimeout(() => runNextBenchmarkJob(runId, epoch), 420);
+        return;
+      }
+      resetBenchmarkEnvironmentBefore(next, runId, epoch, true, '后端环境已复位，准备运行下一组');
+    } else {
+      benchmarkTimerRef.current = window.setTimeout(() => runNextBenchmarkJob(runId, epoch), 120);
+    }
+  };
+
+  function runNextBenchmarkJob(runId: number, epoch: number) {
+    if (runId !== benchmarkRunRef.current || epoch !== lifecycleEpochRef.current) return;
+    const job = benchmarkQueueRef.current.shift();
+    if (!job) {
+      benchmarkRunningRef.current = false;
+      setBenchmarkStatus('COMPLETED');
+      setBenchmarkProgress(100);
+      setBenchmarkStage('全部 Scale 完成');
+      return;
+    }
+    const targetSeries = benchmarkSeriesRef.current.find((item) => item.id === job.seriesId);
+    if (!targetSeries) {
+      failBenchmarkJob(job, '实验配置丢失，无法继续', runId, epoch);
+      return;
+    }
+    benchmarkCurrentJobRef.current = job;
+    setBenchmarkCurrentJob(job);
+    updateBenchmarkSeries((current) => current.map((item) => item.id === job.seriesId ? { ...item, scaleStatus: { ...item.scaleStatus, [job.clients]: 'RUNNING' } } : item));
+    setBenchmarkStage(`运行 ${targetSeries.label} · ${job.clients} Clients · ${formatNumber(targetSeries.config.requests)} Requests`);
+
+    if (!backendMode) {
+      benchmarkTimerRef.current = window.setTimeout(() => completeBenchmarkJob(job, makeBenchmarkPoint(targetSeries.config, job.clients), runId, epoch), 620);
+      return;
+    }
+
+    void (async () => {
+      try {
+        const startResponse = await startRemoteBenchmark({
+          clients: job.clients,
+          requests: targetSeries.config.requests,
+          runtime: targetSeries.config.runtime.toLowerCase() as 'sync' | 'async',
+          lock: targetSeries.config.lock.toLowerCase() as 'mutex' | 'rwlock',
+          workload: workloadForApi(targetSeries.config.workload),
+        });
+        if (runId !== benchmarkRunRef.current || epoch !== lifecycleEpochRef.current) return;
+        if (!startResponse.accepted) {
+          failBenchmarkJob(job, `${job.clients} Clients 未被后端接受`, runId, epoch);
+          return;
+        }
+        let attempts = 0;
+        const poll = async () => {
+          if (runId !== benchmarkRunRef.current || epoch !== lifecycleEpochRef.current) return;
+          try {
+            const state = await readRemoteBenchmark();
+            if (runId !== benchmarkRunRef.current || epoch !== lifecycleEpochRef.current) return;
+            attempts += 1;
+            const remotePoint = state.points.find((point) => point.clients === job.clients);
+            if (state.status === 'COMPLETED' && remotePoint) {
+              completeBenchmarkJob(job, remotePoint, runId, epoch);
+              return;
+            }
+            if (state.status === 'COMPLETED' && !remotePoint) {
+              failBenchmarkJob(job, `${job.clients} Clients 完成但缺少结果点`, runId, epoch);
+              return;
+            }
+            if (state.status === 'INTERRUPTED' || state.status === 'STOPPED' || state.error) {
+              failBenchmarkJob(job, state.error ?? `${job.clients} Clients 测试被中断`, runId, epoch);
+              return;
+            }
+            if (attempts >= 180) {
+              failBenchmarkJob(job, `${job.clients} Clients 状态轮询超时`, runId, epoch);
+              return;
+            }
+            benchmarkTimerRef.current = window.setTimeout(() => void poll(), 320);
+          } catch (error) {
+            failBenchmarkJob(job, `${job.clients} Clients 请求失败 · ${error instanceof Error ? error.message : '未知错误'}`, runId, epoch);
+          }
+        };
+        void poll();
+      } catch (error) {
+        failBenchmarkJob(job, `${job.clients} Clients 无法启动 · ${error instanceof Error ? error.message : '未知错误'}`, runId, epoch);
+      }
+    })();
+  }
 
   const startBenchmark = () => {
-    if (serverState !== 'ONLINE' || !benchmarkScales.length) return;
+    if (serverState !== 'ONLINE' || !benchmarkScales.length || benchmarkStopping) return;
     clearTimer(benchmarkTimerRef);
+    const epoch = lifecycleEpochRef.current;
+    const runId = ++benchmarkRunRef.current;
+    const config: BenchmarkConfig = { runtime: benchmarkRuntime, lock: benchmarkLock, workload: benchmarkWorkload, requests: BENCHMARK_REQUESTS };
+    const nextSeries = buildBenchmarkSeries(benchmarkMode, benchmarkResearchVariable, config, benchmarkScales);
+    const jobs = nextSeries.flatMap((item) => benchmarkScales.map((clients) => ({ seriesId: item.id, clients })));
+    benchmarkSeriesRef.current = nextSeries;
+    benchmarkQueueRef.current = jobs;
+    benchmarkCompletedRef.current = 0;
+    benchmarkTotalRef.current = jobs.length;
+    benchmarkCurrentJobRef.current = null;
+    setBenchmarkSeries(nextSeries);
+    setBenchmarkCurrentJob(null);
+    benchmarkRunningRef.current = true;
     setBenchmarkStatus('RUNNING');
     setBenchmarkProgress(0);
-    setBenchmarkResults([]);
-    const allData = makeBenchmarkData(benchmarkWorkload).filter((point) => benchmarkScales.includes(point.clients));
-    let index = 0;
-    benchmarkTimerRef.current = window.setInterval(() => {
-      const point = allData[index];
-      if (point) {
-        setBenchmarkResults((previous) => [...previous, point]);
-        index += 1;
-        setBenchmarkProgress(index / allData.length * 100);
-      }
-      if (index >= allData.length) {
-        clearTimer(benchmarkTimerRef);
-        setBenchmarkStatus('COMPLETED');
-        addOperation('BENCH', `${allData.length} scales`, 'system', '本地模拟完成', `约 ${(allData.length * 0.9).toFixed(1)}s`);
-      }
-    }, 850);
+    setBenchmarkEnvironmentResets(0);
+    setBenchmarkStage(backendMode ? '请求后端准备统一数据集与固定持久化条件' : '准备统一数据集与固定持久化条件');
+    if (backendMode) {
+      resetBenchmarkEnvironmentBefore(jobs[0], runId, epoch, false, '后端初始环境已准备，开始第一组');
+    } else {
+      benchmarkTimerRef.current = window.setTimeout(() => runNextBenchmarkJob(runId, epoch), 260);
+    }
   };
 
-  const stopBenchmark = () => {
+  const stopBenchmark = async () => {
+    if (benchmarkStopping) return;
+    const stopEpoch = lifecycleEpochRef.current;
     clearTimer(benchmarkTimerRef);
-    setBenchmarkStatus('INTERRUPTED');
-    addOperation('STOP', 'benchmark', 'system', '保留已完成点', '—');
+    benchmarkRunRef.current += 1;
+    benchmarkRunningRef.current = false;
+    const job = benchmarkCurrentJobRef.current;
+    if (job) updateBenchmarkSeries((current) => current.map((item) => item.id === job.seriesId ? { ...item, scaleStatus: { ...item.scaleStatus, [job.clients]: 'WAITING' } } : item));
+    benchmarkCurrentJobRef.current = null;
+    setBenchmarkCurrentJob(null);
+    setBenchmarkStatus('STOPPED');
+    setBenchmarkStage('实验已停止；已完成数据点保留');
+    setBenchmarkStopping(backendMode);
+    addOperation('STOP', 'performance lab', 'system', '已停止并保留完成点', '—');
+    if (backendMode) {
+      try {
+        const response = await stopRemoteBenchmark();
+        if (stopEpoch === lifecycleEpochRef.current && !response.stopped) {
+          setBenchmarkStage('实验数据已保留，但后端未确认停止');
+          addOperation('STOP', 'performance lab', 'error', '后端未确认停止', '—');
+        }
+      } catch {
+        if (stopEpoch === lifecycleEpochRef.current) {
+          setBenchmarkStage('实验数据已保留，但后端停止请求失败');
+          addOperation('STOP', 'performance lab', 'error', '后端停止请求失败', '—');
+        }
+      } finally {
+        if (stopEpoch === lifecycleEpochRef.current) setBenchmarkStopping(false);
+      }
+    }
   };
 
-  const publishMessage = () => {
-    if (serverState !== 'ONLINE' || !pubsubMessage.trim() || !pubsubChannel.trim()) return;
-    setPublishing(true);
-    setPubsubLogs((previous) => [...previous, `[PUB] Publisher → #${pubsubChannel} · “${pubsubMessage}”`]);
-    publishTimerRef.current = window.setTimeout(() => {
-      const delivered = subscribers.filter((subscriber) => subscriber.active).length;
-      setSubscribers((previous) => previous.map((subscriber) => subscriber.active ? { ...subscriber, received: [pubsubMessage, ...subscriber.received].slice(0, 3) } : subscriber));
-      setPubsubLogs((previous) => [...previous, `[ROUTE] Broker 匹配到 ${delivered} 个订阅者`, `[DELIVER] 消息已成功投递 ${delivered} 次`]);
-      setPublishing(false);
-      addOperation('PUBLISH', `#${pubsubChannel}`, 'system', `本地模拟 ${delivered} 次投递`, '—');
-      publishTimerRef.current = null;
-    }, 720);
+  const retryFailedBenchmark = () => {
+    if (serverState !== 'ONLINE' || benchmarkStopping) return;
+    clearTimer(benchmarkTimerRef);
+    const epoch = lifecycleEpochRef.current;
+    const runId = ++benchmarkRunRef.current;
+    updateBenchmarkSeries((current) => current.map((item) => ({
+      ...item,
+      scaleStatus: Object.fromEntries(Object.entries(item.scaleStatus).map(([scale, value]) => [Number(scale), value === 'FAILED' ? 'WAITING' : value])) as Record<number, ScaleStatus>,
+    })));
+    const retryJobs: BenchmarkJob[] = [];
+    for (const item of benchmarkSeriesRef.current) {
+      const orderedScales = Object.entries(item.scaleStatus)
+        .filter(([, value]) => value === 'WAITING' || value === 'FAILED')
+        .map(([clients]) => Number(clients))
+        .sort((a, b) => a - b);
+      for (const clients of orderedScales) retryJobs.push({ seriesId: item.id, clients });
+    }
+    benchmarkQueueRef.current = retryJobs;
+    benchmarkCompletedRef.current = benchmarkSeriesRef.current.reduce((count, item) => count + Object.values(item.scaleStatus).filter((value) => value === 'DONE').length, 0);
+    benchmarkTotalRef.current = benchmarkSeriesRef.current.reduce((count, item) => count + Object.keys(item.scaleStatus).length, 0);
+    benchmarkRunningRef.current = true;
+    setBenchmarkStatus('RUNNING');
+    setBenchmarkStage(backendMode ? '重试前请求后端恢复统一环境' : '重试前恢复统一环境');
+    if (!retryJobs.length) {
+      benchmarkRunningRef.current = false;
+      setBenchmarkStatus('COMPLETED');
+      setBenchmarkProgress(100);
+      setBenchmarkStage('没有待重试 Scale');
+    } else if (backendMode) {
+      resetBenchmarkEnvironmentBefore(retryJobs[0], runId, epoch, true, '后端环境已复位，继续未完成 Scale');
+    } else {
+      setBenchmarkEnvironmentResets((value) => value + 1);
+      benchmarkTimerRef.current = window.setTimeout(() => runNextBenchmarkJob(runId, epoch), 260);
+    }
   };
 
-  const addSubscriber = () => {
-    if (serverState !== 'ONLINE' || publishing || subscribers.length >= 4) return;
-    const id = Math.max(0, ...subscribers.map((subscriber) => subscriber.id)) + 1;
-    setSubscribers((previous) => [...previous, { id, name: `Subscriber ${String.fromCharCode(64 + id)}`, active: true, received: [] }]);
-    setPubsubLogs((previous) => [...previous, `[SUB] Subscriber ${String.fromCharCode(64 + id)} → #${pubsubChannel}`]);
+  const applyBenchmarkPreset = (value: Exclude<BenchmarkPreset, null>) => {
+    clearBenchmarkResultsForConfigChange();
+    setBenchmarkPreset(value);
+    setBenchmarkMode('COMPARE');
+    setBenchmarkScales([...BENCHMARK_SCALES]);
+    if (value === 'A') {
+      setBenchmarkResearchVariable('RUNTIME');
+      setBenchmarkRuntime('Sync');
+      setBenchmarkLock('Mutex');
+      setBenchmarkWorkload('MIXED');
+    } else if (value === 'B') {
+      setBenchmarkResearchVariable('LOCK');
+      setBenchmarkRuntime('Sync');
+      setBenchmarkLock('Mutex');
+      setBenchmarkWorkload('READ_HEAVY');
+    } else {
+      setBenchmarkResearchVariable('WORKLOAD');
+      setBenchmarkRuntime('Async');
+      setBenchmarkLock('RwLock');
+      setBenchmarkWorkload('READ_HEAVY');
+    }
   };
 
-  const toggleSubscriber = (id: number) => {
-    if (serverState !== 'ONLINE' || publishing) return;
-    setSubscribers((previous) => previous.map((subscriber) => subscriber.id === id ? { ...subscriber, active: !subscriber.active } : subscriber));
-    const target = subscribers.find((subscriber) => subscriber.id === id);
-    if (target) setPubsubLogs((previous) => [...previous, `[${target.active ? 'UNSUB' : 'SUB'}] ${target.name} ${target.active ? '离开' : '加入'} #${pubsubChannel}`]);
-  };
-
-  const resetLab = () => {
+  const resetLab = (stopRemoteRuns = true) => {
+    const stopConcurrencyOnBackend = stopRemoteRuns && backendMode && (concurrencyStatus === 'RUNNING' || concurrencyStopping);
+    const stopBenchmarkOnBackend = stopRemoteRuns && backendMode && (benchmarkStatus === 'RUNNING' || benchmarkStopping);
+    lifecycleEpochRef.current += 1;
+    const resetEpoch = lifecycleEpochRef.current;
+    concurrencyRunRef.current += 1;
+    concurrencyRunningRef.current = false;
+    recoveryRunRef.current += 1;
+    benchmarkRunRef.current += 1;
+    benchmarkRunningRef.current = false;
+    suspendHealthProbeRef.current = false;
+    if (backendMode) setBackendProbeEpoch((value) => value + 1);
     clearTimer(concurrencyTimerRef);
     clearTimer(recoveryTimerRef);
-    clearTimer(compactTimerRef);
     clearTimer(benchmarkTimerRef);
-    if (publishTimerRef.current !== null) window.clearTimeout(publishTimerRef.current);
+    setConcurrencyStopping(stopConcurrencyOnBackend);
+    setBenchmarkStopping(stopBenchmarkOnBackend);
+    if (stopConcurrencyOnBackend) {
+      void stopRemoteConcurrency()
+        .catch(() => undefined)
+        .finally(() => {
+          if (resetEpoch === lifecycleEpochRef.current) setConcurrencyStopping(false);
+        });
+    }
+    if (stopBenchmarkOnBackend) {
+      void stopRemoteBenchmark()
+        .catch(() => undefined)
+        .finally(() => {
+          if (resetEpoch === lifecycleEpochRef.current) setBenchmarkStopping(false);
+        });
+    }
     setActiveTab('overview');
-    setDemoMode(false);
-    setServerState('ONLINE');
+    if (!backendMode) {
+      setServerState('ONLINE');
+      setEntries(makeInitialEntries());
+    }
     setLastUpdate('刚刚');
-    setEntries(makeInitialEntries());
-    setWalRecords(INITIAL_WAL_RECORDS);
-    setWalBytes(INITIAL_WAL_BYTES);
     setOperations(initialOperations);
     setConcurrencyClients(100);
     setRequestsPerClient(100);
-    setConcurrencyWorkload('混合读写');
+    setConcurrencyWorkload('MIXED');
     setConcurrencyStatus('IDLE');
     setConcurrencyProgress(0);
     setConcurrencySuccessful(0);
     setConcurrencyFailed(0);
-    setConcurrencyThroughput(0);
-    setConcurrencyElapsed(0);
     setRecoveryPhase('IDLE');
     setRecoverySeedCount(100);
     setInjectRecoveryFailure(false);
@@ -1182,38 +1941,55 @@ export default function Home() {
     setBeforeFingerprint('');
     setAfterFingerprint('');
     setRecoverySamples([]);
-    setCompactRunning(false);
-    setCompactProgress(0);
-    setCompactResult(null);
-    setBenchmarkScales([1, 10, 50, 100]);
-    setBenchmarkWorkload('混合读写');
+    setRecoveryVerificationEntries([]);
+    setWalReplayCount(backendMode ? null : 0);
+    setRecoveryTime(0);
+    setBenchmarkMode('COMPARE');
+    setBenchmarkResearchVariable('LOCK');
+    setBenchmarkRuntime('Sync');
+    setBenchmarkLock('Mutex');
+    setBenchmarkScales([...BENCHMARK_SCALES]);
+    setBenchmarkWorkload('READ_HEAVY');
+    setBenchmarkPreset('B');
     setBenchmarkStatus('IDLE');
     setBenchmarkProgress(0);
-    setBenchmarkResults([]);
-    setSubscribers([{ id: 1, name: 'Subscriber A', active: true, received: [] }, { id: 2, name: 'Subscriber B', active: true, received: [] }, { id: 3, name: 'Subscriber C', active: false, received: [] }]);
-    setPubsubChannel('news');
-    setPubsubMessage('Hello Rust');
-    setPublishing(false);
-    setPubsubLogs(['[READY] 发布订阅原型已就绪', '[SUB] Subscriber A → #news', '[SUB] Subscriber B → #news']);
+    setBenchmarkSeries([]);
+    setBenchmarkCurrentJob(null);
+    setBenchmarkStage('等待运行实验');
+    setBenchmarkEnvironmentResets(0);
     recoverySnapshotRef.current = [];
-    publishTimerRef.current = null;
+    recoveryWalRef.current = [];
+    benchmarkQueueRef.current = [];
+    benchmarkSeriesRef.current = [];
+    benchmarkCurrentJobRef.current = null;
+    benchmarkCompletedRef.current = 0;
+    benchmarkTotalRef.current = 0;
     logIdRef.current = 0;
     setResetOpen(false);
   };
 
+  const switchExecutionMode = () => {
+    const nextBackendMode = !backendMode;
+    resetLab(false);
+    setBackendMode(nextBackendMode);
+    setServerState(nextBackendMode ? 'STARTING' : 'ONLINE');
+    setEntries(nextBackendMode ? [] : makeInitialEntries());
+    setLastUpdate(nextBackendMode ? formatClock().slice(0, 8) : '刚刚');
+  };
+
   const displayedKeyCount = serverState === 'RECOVERING' ? recoveredCount : entries.length;
   const metricStrip: LabMetricItem[] = [
-    { label: '本地键总数', value: formatNumber(displayedKeyCount), suffix: '仅浏览器内存', accent: 'cyan' },
+    { label: backendMode ? '后端键总数' : '本地键总数', value: formatNumber(displayedKeyCount), suffix: backendMode ? '来自接入层' : '纯前端内存', accent: 'cyan' },
   ];
   const activeNavigation = navigation.find((item) => item.id === activeTab)!;
 
   return (
-    <main className={`lab-shell ${demoMode ? 'demo-mode' : ''} server-${serverState.toLowerCase()}`}>
+    <main className={`lab-shell ${backendMode ? 'debate-mode' : 'frontend-mode'} server-${serverState.toLowerCase()}`}>
       <header className="topbar">
-        <div className="brand-block"><div className="brand-mark"><Database size={20} /></div><div><strong>RustKV <span>实验室</span></strong><small>纯前端交互演示 · 本次不连接后端</small></div></div>
-        <div className={`connection-pill state-${serverState.toLowerCase()}`}><LabStatusOrb offline={serverState !== 'ONLINE'} /><b>{serverLabels[serverState].label}</b><code>LOCAL DEMO · 未联调</code></div>
+        <div className="brand-block"><div className="brand-mark"><Database size={20} /></div><div><strong>RustKV <span>实验室</span></strong><small>{backendMode ? '答辩模式 · 接入后端实测' : '纯前端模式 · UI 与动画测试'}</small></div></div>
+        <div className={`connection-pill state-${serverState.toLowerCase()} ${backendMode ? 'backend' : 'frontend'}`}><LabStatusOrb offline={serverState !== 'ONLINE'} /><b>{backendMode ? serverLabels[serverState].label : serverState === 'ONLINE' ? 'UI 测试就绪' : serverLabels[serverState].label}</b><code>{backendMode ? 'BACKEND LAB · 答辩实测' : 'FRONTEND ONLY · 非实测'}</code></div>
         <div className="top-actions">
-        <LabButton variant="ghost" className="shell-button" onClick={() => setDemoMode((value) => !value)} aria-pressed={demoMode}><Presentation /> {demoMode ? '退出答辩模式' : '答辩模式'}</LabButton>
+        <LabButton variant="ghost" className="shell-button" onClick={switchExecutionMode} aria-pressed={backendMode}><Presentation /> {backendMode ? '退出答辩模式' : '进入答辩模式'}</LabButton>
         <LabButton variant="outline" className="shell-button" onClick={() => setResetOpen(true)}><RotateCcw /> 重置实验室</LabButton>
         </div>
       </header>
@@ -1226,23 +2002,22 @@ export default function Home() {
         })}
       </nav>
 
-      <LabMetricStrip metrics={metricStrip} aria-label="本地数据概览" />
+      <LabMetricStrip metrics={metricStrip} aria-label={backendMode ? '后端数据概览' : '本地数据概览'} />
 
       <div className="content-area">
-        <div className="page-title-row"><div><p><Activity size={14} /> RUSTKV SYSTEMS LAB / {activeNavigation.hint.toUpperCase()}</p><h1>{activeNavigation.label}</h1></div><div className={`last-update ${serverState !== 'ONLINE' ? 'frozen' : ''}`}><LabStatusOrb offline={serverState !== 'ONLINE'} /> {serverState === 'ONLINE' ? '本地状态 · 刚刚' : `${serverLabels[serverState].label} · 最后更新 ${lastUpdate}`}</div></div>
+        <div className="page-title-row"><div><p><Activity size={14} /> RUSTKV SYSTEMS LAB / {activeNavigation.hint.toUpperCase()}</p><h1>{activeNavigation.label}</h1></div><div className={`last-update ${serverState !== 'ONLINE' ? 'frozen' : ''}`}><LabStatusOrb offline={serverState !== 'ONLINE'} /> {serverState === 'ONLINE' ? (backendMode ? '后端状态 · 刚刚' : '纯前端状态 · 刚刚') : `${serverLabels[serverState].label} · 最后更新 ${lastUpdate}`}</div></div>
 
-        {activeTab === 'overview' && <Overview serverState={serverState} operations={operations} lastUpdate={lastUpdate} concurrencyStatus={concurrencyStatus} concurrencyThroughput={concurrencyThroughput} recoveryPhase={recoveryPhase} recoveryLost={recoveryLost} benchmarkData={benchmarkResults} />}
+        {activeTab === 'overview' && <Overview backendMode={backendMode} serverState={serverState} operations={operations} lastUpdate={lastUpdate} concurrencyStatus={concurrencyStatus} concurrencyFailed={concurrencyFailed} recoveryPhase={recoveryPhase} recoveryLost={recoveryLost} benchmarkStatus={benchmarkStatus} benchmarkSeries={benchmarkSeries} />}
         {activeTab === 'kv' && <KvOperations online={serverState === 'ONLINE'} entries={entries} operations={operations} onAction={performKvAction} />}
-        {activeTab === 'concurrency' && <ConcurrencyPage online={serverState === 'ONLINE'} clients={concurrencyClients} setClients={setConcurrencyClients} requestsPerClient={requestsPerClient} setRequestsPerClient={setRequestsPerClient} workload={concurrencyWorkload} setWorkload={setConcurrencyWorkload} status={concurrencyStatus} progress={concurrencyProgress} successful={concurrencySuccessful} failed={concurrencyFailed} throughput={concurrencyThroughput} elapsed={concurrencyElapsed} onStart={startConcurrency} onStop={stopConcurrency} />}
-        {activeTab === 'recovery' && <RecoveryPage serverState={serverState} phase={recoveryPhase} seedCount={recoverySeedCount} setSeedCount={setRecoverySeedCount} injectFailure={injectRecoveryFailure} setInjectFailure={setInjectRecoveryFailure} beforeCount={recoveryBeforeCount} recoveredCount={recoveredCount} recoveryLost={recoveryLost} progress={recoveryProgress} logs={recoveryLogs} beforeFingerprint={beforeFingerprint} afterFingerprint={afterFingerprint} sampleBefore={recoverySamples} currentEntries={entries} onSeed={seedRecoveryData} onKill={killServer} onRestart={restartServer} compactRunning={compactRunning} compactProgress={compactProgress} compactResult={compactResult} onCompact={runCompact} />}
-        {activeTab === 'performance' && <PerformancePage online={serverState === 'ONLINE'} scales={benchmarkScales} setScales={setBenchmarkScales} workload={benchmarkWorkload} setWorkload={setBenchmarkWorkload} status={benchmarkStatus} progress={benchmarkProgress} results={benchmarkResults} onStart={startBenchmark} onStop={stopBenchmark} />}
-        {activeTab === 'pubsub' && <PubSubPage online={serverState === 'ONLINE'} subscribers={subscribers} channel={pubsubChannel} setChannel={setPubsubChannel} message={pubsubMessage} setMessage={setPubsubMessage} publishing={publishing} logs={pubsubLogs} onPublish={publishMessage} onAddSubscriber={addSubscriber} onToggleSubscriber={toggleSubscriber} />}
+        {activeTab === 'concurrency' && <ConcurrencyPage backendMode={backendMode} online={serverState === 'ONLINE'} clients={concurrencyClients} setClients={setConcurrencyClients} requestsPerClient={requestsPerClient} setRequestsPerClient={setRequestsPerClient} workload={concurrencyWorkload} setWorkload={setConcurrencyWorkload} status={concurrencyStatus} progress={concurrencyProgress} successful={concurrencySuccessful} failed={concurrencyFailed} stopping={concurrencyStopping} onStart={startConcurrency} onStop={stopConcurrency} />}
+        {activeTab === 'recovery' && <RecoveryPage backendMode={backendMode} serverState={serverState} phase={recoveryPhase} seedCount={recoverySeedCount} setSeedCount={setRecoverySeedCount} injectFailure={injectRecoveryFailure} setInjectFailure={setInjectRecoveryFailure} beforeCount={recoveryBeforeCount} recoveredCount={recoveredCount} recoveryLost={recoveryLost} progress={recoveryProgress} logs={recoveryLogs} beforeFingerprint={beforeFingerprint} afterFingerprint={afterFingerprint} sampleBefore={recoverySamples} currentEntries={entries} verificationEntries={recoveryVerificationEntries} walReplayCount={walReplayCount} recoveryTime={recoveryTime} onSeed={seedRecoveryData} onKill={killServer} onRestart={restartServer} />}
+        {activeTab === 'performance' && <PerformancePage backendMode={backendMode} online={serverState === 'ONLINE'} mode={benchmarkMode} setMode={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkMode(value); setBenchmarkPreset(null); }} researchVariable={benchmarkResearchVariable} setResearchVariable={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkResearchVariable(value); setBenchmarkPreset(null); }} runtime={benchmarkRuntime} setRuntime={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkRuntime(value); setBenchmarkPreset(null); }} lock={benchmarkLock} setLock={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkLock(value); setBenchmarkPreset(null); }} scales={benchmarkScales} setScales={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkScales(value); setBenchmarkPreset(null); }} workload={benchmarkWorkload} setWorkload={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkWorkload(value); setBenchmarkPreset(null); }} preset={benchmarkPreset} onApplyPreset={applyBenchmarkPreset} status={benchmarkStatus} progress={benchmarkProgress} series={benchmarkSeries} currentJob={benchmarkCurrentJob} stage={benchmarkStage} environmentResets={benchmarkEnvironmentResets} stopping={benchmarkStopping} onStart={startBenchmark} onStop={stopBenchmark} onRetry={retryFailedBenchmark} />}
       </div>
 
       <AlertDialog open={resetOpen} onOpenChange={setResetOpen}>
         <AlertDialogContent className="reset-dialog">
-          <AlertDialogHeader><AlertDialogTitle>重置整个前端演示环境？</AlertDialogTitle><AlertDialogDescription>这只会清空浏览器中的实验进度，恢复初始键值与模拟在线状态；不会请求后端，也不会修改任何 WAL 文件。</AlertDialogDescription></AlertDialogHeader>
-          <AlertDialogFooter><AlertDialogCancel>取消</AlertDialogCancel><AlertDialogAction onClick={resetLab}><RotateCcw /> 确认重置</AlertDialogAction></AlertDialogFooter>
+          <AlertDialogHeader><AlertDialogTitle>重置当前实验室界面？</AlertDialogTitle><AlertDialogDescription>{backendMode ? '只清空前端实验进度与图表，不删除后端数据、不修改 WAL，也不会切换出答辩模式。' : '清空纯前端实验进度，恢复初始键值与 UI 状态；不会发送任何后端请求。'}</AlertDialogDescription></AlertDialogHeader>
+          <AlertDialogFooter><AlertDialogCancel>取消</AlertDialogCancel><AlertDialogAction onClick={() => resetLab()}><RotateCcw /> 确认重置</AlertDialogAction></AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
     </main>

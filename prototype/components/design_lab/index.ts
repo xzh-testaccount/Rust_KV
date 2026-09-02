@@ -22,6 +22,7 @@ export type {
 export {
   LAB_ACCENT_CLASSES,
   LAB_BADGE_VARIANT_CLASSES,
+  LAB_BENCHMARK_SERIES_COLORS,
   LAB_STATUS_PILL_CLASSES,
 } from './tokens';
 export type { LabAccent, LabBadgeVariant, LabStatusTone } from './tokens';
