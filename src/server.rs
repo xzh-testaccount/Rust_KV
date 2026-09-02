@@ -1,13 +1,20 @@
 //! TCP service-layer entry points.
 
+use std::io;
+use std::io::Error;
+use std::io::ErrorKind;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use crate::error::{AppError, ErrorCode, Result};
 use crate::persistence::PersistentStore;
 use crate::protocol::{
-    Frame, Request, Response, ResponseData, encode_response_line, parse_request_bytes,
+    Frame, Request, Response, ResponseData, encode_response_line, parse_request_bytes, read_frame,
     read_frame_async,
 };
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -23,6 +30,7 @@ pub const DEFAULT_WAL_PATH: &str = "data/kv.wal";
 pub struct ServerConfig {
     pub bind: SocketAddr,
     pub wal_path: PathBuf,
+    pub sync: bool,
 }
 
 impl Default for ServerConfig {
@@ -32,6 +40,7 @@ impl Default for ServerConfig {
                 .parse()
                 .expect("the built-in bind address must be valid"),
             wal_path: PathBuf::from(DEFAULT_WAL_PATH),
+            sync: false, // 默认异步
         }
     }
 }
@@ -48,6 +57,7 @@ impl ServerConfig {
         let mut bind_seen = false;
         let mut data_seen = false;
         let mut help_seen = false;
+        let mut sync_seen = false;
 
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -103,6 +113,22 @@ impl ServerConfig {
                     })?;
                     config.wal_path = PathBuf::from(value);
                 }
+                "--sync" => {
+                    if help_seen {
+                        return Err(AppError::protocol(
+                            ErrorCode::ExtraArgument,
+                            "--help  must be used alone",
+                        ));
+                    }
+                    if sync_seen {
+                        return Err(AppError::protocol(
+                            ErrorCode::ExtraArgument,
+                            "duplicate --sync option",
+                        ));
+                    }
+                    sync_seen = true;
+                    config.sync = true;
+                }
                 _ if argument.starts_with('-') => {
                     if help_seen {
                         return Err(AppError::protocol(
@@ -138,12 +164,179 @@ impl ServerConfig {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage: kv-server [--bind HOST:PORT] [--data PATH]\n\nOptions:\n  --bind HOST:PORT  listening address (default 127.0.0.1:7878)\n  --data PATH        WAL path (default data/kv.wal)\n  -h, --help        show this help\n"
+    "Usage: kv-server [--bind HOST:PORT] [--data PATH] [--sync]\n\nOptions:\n  --bind HOST:PORT  listening address (default 127.0.0.1:7878)\n  --data PATH       WAL path (default data/kv.wal)\n  --sync            use synchronous (default asynchronous)\n  -h, --help        show this help\n"
 }
 
 /// 打开一个设定好的PersistentStore
 pub fn open(config: &ServerConfig) -> Result<PersistentStore> {
     PersistentStore::open(&config.wal_path)
+}
+
+/// 同步运行服务器
+pub fn _run(config: ServerConfig) -> Result<()> {
+    let store = Arc::new(std::sync::Mutex::new(open(&config)?));
+    let listener = std::net::TcpListener::bind(config.bind)?;
+    listener.set_nonblocking(true)?;
+    _server(listener, store, Arc::new(AtomicBool::new(false)))
+}
+
+/// 同步服务主循环
+pub fn _server(
+    listener: std::net::TcpListener,
+    store: Arc<std::sync::Mutex<PersistentStore>>,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
+    listener.set_nonblocking(true)?;
+    while !stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
+                }
+                let shared_store = Arc::clone(&store);
+                thread::spawn(move || _handle_connection(stream, shared_store));
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// 同步处理单个客户端连接
+fn _handle_connection(stream: std::net::TcpStream, store: Arc<std::sync::Mutex<PersistentStore>>) {
+    let writer = match stream.try_clone() {
+        Ok(writer) => writer,
+        Err(_) => return,
+    };
+    let mut reader = std::io::BufReader::new(stream);
+    let mut writer = writer;
+
+    loop {
+        let frame = match read_frame(&mut reader) {
+            Ok(frame) => frame,
+            Err(_) => return,
+        };
+        let (response, close) = match frame {
+            Frame::Eof => return,
+            Frame::Incomplete => (
+                Response::error(ErrorCode::InvalidRequest, "incomplete request frame"),
+                true,
+            ),
+            Frame::TooLarge => (
+                Response::error(ErrorCode::FrameTooLarge, "request frame is too large"),
+                false,
+            ),
+            Frame::Line(line) => match parse_request_bytes(&line) {
+                Ok(request) => _dispatch(request, &store),
+                Err(e) => (Response::from_error(&e), false),
+            },
+        };
+
+        if _write_response(&mut writer, &response).is_err() {
+            return;
+        }
+        if close {
+            return;
+        }
+    }
+}
+
+/// 同步分发请求
+fn _dispatch(request: Request, store: &Arc<std::sync::Mutex<PersistentStore>>) -> (Response, bool) {
+    match request {
+        Request::Ping => (Response::success(ResponseData::Ping), false),
+        Request::Quit => (Response::success(ResponseData::Quit), true),
+        Request::Set { key, value } => {
+            let result = store
+                .lock()
+                .map_err(|_| AppError::Storage {
+                    message: "storage mutex poisoned".to_owned(),
+                })
+                .and_then(|mut store| store.set(key, value));
+            match result {
+                Ok(outcome) => (
+                    Response::success(ResponseData::Set {
+                        replaced: outcome.replaced(),
+                    }),
+                    false,
+                ),
+                Err(e) => (Response::from_error(&e), false),
+            }
+        }
+        Request::Get { key } => {
+            let result = store
+                .lock()
+                .map_err(|_| AppError::Storage {
+                    message: "storage mutex poisoned".to_owned(),
+                })
+                .and_then(|store| store.get(&key).map(|v| v.to_string()));
+            match result {
+                Ok(value) => (
+                    Response::success(ResponseData::Get {
+                        value: value.to_string(),
+                    }),
+                    false,
+                ),
+                Err(e) => (Response::from_error(&e), false),
+            }
+        }
+        Request::Delete { key } => {
+            let result = store
+                .lock()
+                .map_err(|_| AppError::Storage {
+                    message: "storage mutex poisoned".to_owned(),
+                })
+                .and_then(|mut store| store.delete(&key));
+            match result {
+                Ok(_) => (
+                    Response::success(ResponseData::Delete { deleted: true }),
+                    false,
+                ),
+                Err(e) => (Response::from_error(&e), false),
+            }
+        }
+        Request::Keys => {
+            let result = store
+                .lock()
+                .map_err(|_| AppError::Storage {
+                    message: "storage mutex poisoned".to_owned(),
+                })
+                .map(|store| (store.keys(), store.len()));
+            match result {
+                Ok((keys, count)) => (Response::success(ResponseData::Keys { keys, count }), false),
+                Err(e) => (Response::from_error(&e), false),
+            }
+        }
+        Request::Status => {
+            let result = store
+                .lock()
+                .map_err(|_| AppError::Storage {
+                    message: "storage mutex poisoned".to_owned(),
+                })
+                .map(|store| store.len());
+            match result {
+                Ok(count) => (Response::success(ResponseData::Status { count }), false),
+                Err(e) => (Response::from_error(&e), false),
+            }
+        }
+    }
+}
+
+/// 同步写入响应
+fn _write_response(writer: &mut std::net::TcpStream, response: &Response) -> io::Result<()> {
+    let encoded = encode_response_line(response)
+        .or_else(|_| {
+            encode_response_line(&Response::error(
+                ErrorCode::FrameTooLarge,
+                "response frame is too large",
+            ))
+        })
+        .map_err(|error| Error::other(error.to_string()))?;
+    writer.write_all(&encoded)?;
+    writer.flush()
 }
 
 /// 异步运行服务器
@@ -300,7 +493,7 @@ async fn write_response(
                 "response frame is too large",
             ))
         })
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map_err(|e| Error::other(e.to_string()))?;
     writer.write_all(&encoded).await?;
     writer.flush().await?;
     Ok(())

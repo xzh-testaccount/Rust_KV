@@ -5,7 +5,14 @@ async fn main() {
             print!("{}", rust_kv_store::server::help_text());
         }
         Ok(Some(config)) => {
-            if let Err(error) = rust_kv_store::server::run(config).await {
+            let result = if config.sync {
+                // 同步运行服务器
+                rust_kv_store::server::_run(config)
+            } else {
+                // 异步运行服务器
+                rust_kv_store::server::run(config).await
+            };
+            if let Err(error) = result {
                 eprintln!("server error: {error}");
                 std::process::exit(1);
             }

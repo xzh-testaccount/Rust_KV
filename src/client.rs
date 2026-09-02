@@ -2,8 +2,8 @@
 
 use crate::error::{AppError, ErrorCode, Result};
 use crate::protocol::{
-    Frame, Response, ResponseData, encode_request_line, parse_command,
-    read_frame_async, parse_response_line,
+    Frame, Response, ResponseData, encode_request_line, parse_command, parse_response_line,
+    read_frame_async,
 };
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
