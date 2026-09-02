@@ -1,12 +1,6 @@
 //! 异步命令行客户端。
 
-use crate::error::{AppError, ErrorCode, Result};
-use crate::protocol::{
-    Frame, Response, ResponseData, encode_request_line, parse_command, parse_response_line,
-    read_frame_async,
-};
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use std::net::SocketAddr;
 
 use tokio::{
     io::{self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
@@ -29,7 +23,7 @@ storage-status | compact | ping | quit";
 /// 客户端启动参数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
-    pub server: String,
+    pub server: SocketAddr,
 }
 
 impl Default for ClientConfig {
