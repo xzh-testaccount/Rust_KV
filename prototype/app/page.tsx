@@ -108,7 +108,6 @@ type Workload = '读取为主' | '写入为主' | '混合读写';
 type KvEntry = {
   key: string;
   value: string;
-  expiresAt?: number;
 };
 
 type OperationLog = {
@@ -207,6 +206,41 @@ function formatNumber(value: number) {
   return new Intl.NumberFormat('zh-CN').format(Math.max(0, Math.round(value)));
 }
 
+const textEncoder = new TextEncoder();
+
+function hasControlCharacter(value: string) {
+  return Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f);
+  });
+}
+
+function validateKey(key: string): KvResult | null {
+  if (!key) {
+    return { kind: 'error', title: '键不能为空', message: '请输入一个非空 Key 后再执行。' };
+  }
+  if (/\s/u.test(key) || hasControlCharacter(key)) {
+    return { kind: 'error', title: '键格式无效 INVALID_KEY', message: 'Key 不能包含空白字符或控制字符。' };
+  }
+  if (textEncoder.encode(key).length > 256) {
+    return { kind: 'error', title: '键过长 INVALID_KEY', message: 'Key 的 UTF-8 长度不能超过 256 字节。' };
+  }
+  return null;
+}
+
+function validateValue(value: string): KvResult | null {
+  if (!value) {
+    return { kind: 'error', title: '值不能为空', message: '请输入要写入的字符串 Value。' };
+  }
+  if (hasControlCharacter(value)) {
+    return { kind: 'error', title: '值格式无效 INVALID_VALUE', message: 'Value 不能包含换行、制表符或其他控制字符；普通空格可以保留。' };
+  }
+  if (textEncoder.encode(value).length > 16 * 1024) {
+    return { kind: 'error', title: '值过长 INVALID_VALUE', message: 'Value 的 UTF-8 长度不能超过 16 KiB。' };
+  }
+  return null;
+}
+
 function formatBytes(value: number) {
   if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
   if (value >= 1024) return `${Math.round(value / 1024)} KB`;
@@ -225,15 +259,9 @@ function fingerprintFor(entries: KvEntry[]) {
   return `0x${(hash >>> 0).toString(16).toUpperCase().padStart(8, '0')}`;
 }
 
-const initialOperations: OperationLog[] = [
-  { id: 5, time: '14:32:18.204', op: 'SET', detail: 'session:demo', latency: '1.4ms', tone: 'write', result: '成功' },
-  { id: 4, time: '14:32:18.116', op: 'GET', detail: 'user:1001', latency: '0.6ms', tone: 'read', result: '命中' },
-  { id: 3, time: '14:32:17.983', op: 'SET', detail: 'course:stage', latency: '1.1ms', tone: 'write', result: '成功' },
-  { id: 2, time: '14:32:17.742', op: 'GET', detail: 'config:engine', latency: '0.5ms', tone: 'read', result: '命中' },
-  { id: 1, time: '14:32:17.604', op: 'DEL', detail: 'temp:scan:04', latency: '0.9ms', tone: 'delete', result: '成功' },
-];
+const initialOperations: OperationLog[] = [];
 
-const baselineBenchmark: BenchmarkPoint[] = [
+const simulationBenchmarkTemplate: BenchmarkPoint[] = [
   { clients: 1, qps: 1480, p50: 0.42, p95: 0.9, p99: 1.4, success: 100 },
   { clients: 10, qps: 7920, p50: 0.74, p95: 1.8, p99: 3.1, success: 100 },
   { clients: 50, qps: 12_340, p50: 1.3, p95: 4.7, p99: 8.2, success: 99.99 },
@@ -250,32 +278,8 @@ const latencyChartConfig = {
   p99: { label: 'P99 延迟', color: '#f09a58' },
 } satisfies ChartConfig;
 
-function Sparkline({ offline = false }: { offline?: boolean }) {
-  return (
-    <svg className={`throughput-chart ${offline ? 'is-frozen' : ''}`} viewBox="0 0 680 180" aria-label="最近 60 秒吞吐量曲线">
-      <defs>
-        <linearGradient id="throughput-fill" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={offline ? '#627083' : '#26d995'} stopOpacity="0.28" />
-          <stop offset="100%" stopColor={offline ? '#627083' : '#26d995'} stopOpacity="0" />
-        </linearGradient>
-        <filter id="green-glow">
-          <feGaussianBlur stdDeviation="3" result="blur" />
-          <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
-        </filter>
-      </defs>
-      {[28, 68, 108, 148].map((y) => <line key={y} x1="0" y1={y} x2="680" y2={y} className="chart-grid" />)}
-      <path d="M0 150 C30 142,42 118,68 126 S102 92,130 103 S170 122,198 88 S238 58,266 72 S306 100,334 67 S374 40,406 64 S440 112,470 93 S512 48,542 58 S582 87,612 72 S652 42,680 52 L680 180 L0 180 Z" fill="url(#throughput-fill)" />
-      <path d="M0 150 C30 142,42 118,68 126 S102 92,130 103 S170 122,198 88 S238 58,266 72 S306 100,334 67 S374 40,406 64 S440 112,470 93 S512 48,542 58 S582 87,612 72 S652 42,680 52" className="chart-line" filter="url(#green-glow)" />
-      <circle cx="680" cy="52" r="4" className="chart-dot" />
-    </svg>
-  );
-}
-
 function Overview({
   serverState,
-  qps,
-  walRecords,
-  walBytes,
   operations,
   lastUpdate,
   concurrencyStatus,
@@ -285,9 +289,6 @@ function Overview({
   benchmarkData,
 }: {
   serverState: ServerState;
-  qps: number;
-  walRecords: number;
-  walBytes: number;
   operations: OperationLog[];
   lastUpdate: string;
   concurrencyStatus: ExperimentStatus;
@@ -303,53 +304,35 @@ function Overview({
       <LabPanel className={`server-card ${online ? '' : 'offline-panel'}`}>
         <div className="panel-kicker"><Server size={15} /> 服务节点</div>
         <div className={`server-state state-${serverState.toLowerCase()}`}><LabStatusOrb offline={!online} /> {serverLabels[serverState].label}</div>
-        <p className="muted">RustKV Server · 127.0.0.1:7878</p>
-        <div className="server-meta">
-          <div><span>运行时长</span><strong>{online ? '02:14:33' : '已冻结'}</strong></div>
-          <div><span>版本</span><strong>v0.3.0</strong></div>
-          <div><span>存储引擎</span><strong>BTreeMap</strong></div>
+        <p className="muted">目标地址 127.0.0.1:7878 · 本次不连接后端</p>
+        <div className="frontend-scope">
+          <div><span>状态来源</span><strong>前端本地状态机</strong></div>
+          <div><span>网络请求</span><strong>未发送</strong></div>
+          <div><span>数据范围</span><strong>仅当前页面会话</strong></div>
         </div>
         <div className={online ? 'healthy-row' : 'error-row'}>
           {online ? <CheckCircle2 size={15} /> : <WifiOff size={15} />}
-          {online ? '网络、内存与持久化均正常' : `最后更新 ${lastUpdate}`}
+          {online ? '前端交互状态正常，可开始本地演示' : `本地模拟已切换为离线 · ${lastUpdate}`}
         </div>
-      </LabPanel>
-
-      <LabPanel className="throughput-card">
-        <LabPanelHeader icon={<Activity size={15} />} eyebrow="实时吞吐" title={online ? '请求正在实时进入' : '服务离线，曲线已冻结'} action={<div className="live-number"><strong>{formatNumber(qps)}</strong><span>请求/秒</span></div>} />
-        <Sparkline offline={!online} />
-        <div className="chart-footer"><span>60 秒前</span><span>峰值 <strong>{formatNumber(Math.max(1438, peak))} 请求/秒</strong></span><span>现在</span></div>
-      </LabPanel>
-
-      <LabPanel className="wal-card">
-        <div className="panel-kicker orange"><FileClock size={15} /> 持久化 / WAL</div>
-        <div className="wal-state"><span>{serverState === 'RECOVERING' ? '正在重放' : '磁盘日志健康'}</span><strong>{formatBytes(walBytes)}</strong></div>
-        <div className="wal-track"><i style={{ width: `${Math.min(88, 38 + walRecords / 260)}%` }} /></div>
-        <div className="wal-stats">
-          <div><span>日志记录</span><strong>{formatNumber(walRecords)}</strong></div>
-          <div><span>最近同步</span><strong>{online ? '8ms 前' : '服务终止前'}</strong></div>
-          <div><span>恢复策略</span><strong>顺序重放</strong></div>
-        </div>
-        <div className="wal-note"><Zap size={14} /> 先落盘，再修改内存；崩溃后日志仍在。</div>
       </LabPanel>
 
       <LabPanel className="experiment-card">
-        <LabPanelHeader icon={<Boxes size={15} />} eyebrow="最近实验" title="答辩关键结论" action={<span className="all-pass">结论可复验</span>} />
+        <LabPanelHeader icon={<Boxes size={15} />} eyebrow="本地实验" title="页面交互进度" action={<span className="prototype-label">前端本地模拟</span>} />
         <div className="experiment-list">
-          <div><span className="experiment-icon cyan"><Network size={17} /></span><p><strong>多客户端并发</strong><small>100 客户端 · 混合读写</small></p><b>{concurrencyThroughput ? `${(concurrencyThroughput / 1000).toFixed(1)}k` : '12.3k'} <small>请求/秒</small></b><em>{concurrencyStatus === 'RUNNING' ? '运行中' : '通过'}</em></div>
-          <div><span className="experiment-icon green"><ShieldCheck size={17} /></span><p><strong>断电重启恢复</strong><small>WAL 重放 · 前后自动校验</small></p><b>{recoveryPhase === 'VERIFIED' ? recoveryLost : 0} <small>丢失</small></b><em>{recoveryPhase === 'VERIFIED' && recoveryLost > 0 ? '异常' : '重启后仍然对'}</em></div>
-          <div><span className="experiment-icon violet"><Gauge size={17} /></span><p><strong>性能基准测试</strong><small>并发甜点 · 50 客户端</small></p><b>{formatNumber(peak || 12_340)} <small>请求/秒</small></b><em>已测量</em></div>
+          <div><span className="experiment-icon cyan"><Network size={17} /></span><p><strong>多客户端并发</strong><small>本地计时器驱动活动矩阵</small></p><b>{concurrencyThroughput ? formatNumber(concurrencyThroughput) : '—'} <small>模拟请求/秒</small></b><em>{concurrencyStatus === 'RUNNING' ? '运行中' : concurrencyStatus === 'COMPLETED' ? '模拟完成' : concurrencyStatus === 'STOPPED' ? '已停止' : '待运行'}</em></div>
+          <div><span className="experiment-icon green"><ShieldCheck size={17} /></span><p><strong>崩溃恢复</strong><small>本地快照 · 故障状态演示</small></p><b>{recoveryPhase === 'VERIFIED' ? recoveryLost : '—'} <small>模拟丢失</small></b><em>{recoveryPhase === 'VERIFIED' ? (recoveryLost > 0 ? '发现不一致' : '模拟通过') : '待运行'}</em></div>
+          <div><span className="experiment-icon violet"><Gauge size={17} /></span><p><strong>性能测试</strong><small>运行后逐点生成演示数据</small></p><b>{peak ? formatNumber(peak) : '—'} <small>模拟请求/秒</small></b><em>{benchmarkData.length ? '模拟完成' : '待运行'}</em></div>
         </div>
       </LabPanel>
 
       <LabPanel className="ops-card">
-        <LabPanelHeader icon={<TerminalSquare size={15} />} eyebrow="实时操作" title="最近请求流" action={<span className={online ? 'streaming' : 'streaming stopped'}><i /> {online ? '正在采样' : '已停止'}</span>} />
+        <LabPanelHeader icon={<TerminalSquare size={15} />} eyebrow="本地操作" title="最近交互记录" action={<span className={online ? 'streaming' : 'streaming stopped'}><i /> {online ? '等待操作' : '已暂停'}</span>} />
         <div className="ops-list">
-          {operations.slice(0, 5).map((row) => (
+          {operations.length ? operations.slice(0, 5).map((row) => (
             <div key={row.id}>
               <time>{row.time}</time><span className={`op-tag ${row.tone}`}>{row.op}</span><code>{row.detail}</code><b>{row.result}</b>
             </div>
-          ))}
+          )) : <div className="empty-log">执行一次键值操作或本地实验后，这里会显示记录。</div>}
         </div>
       </LabPanel>
     </section>
@@ -359,19 +342,16 @@ function Overview({
 function KvOperations({
   online,
   entries,
-  now,
   operations,
   onAction,
 }: {
   online: boolean;
   entries: KvEntry[];
-  now: number;
   operations: OperationLog[];
-  onAction: (action: KvAction, key: string, value: string, ttlSeconds?: number) => KvResult;
+  onAction: (action: KvAction, key: string, value: string) => KvResult;
 }) {
   const [key, setKey] = useState('course:name');
   const [value, setValue] = useState('Rust 网络 KV 存储');
-  const [ttl, setTtl] = useState('');
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(0);
   const [view, setView] = useState<'grid' | 'list'>('grid');
@@ -391,10 +371,14 @@ function KvOperations({
   const pageCount = Math.max(1, Math.ceil(filteredEntries.length / pageSize));
   const safePage = Math.min(page, pageCount - 1);
   const visibleEntries = filteredEntries.slice(safePage * pageSize, (safePage + 1) * pageSize);
+  const visibleResult = online ? result : {
+    kind: 'error' as const,
+    title: '本地服务状态为离线',
+    message: '请先在“崩溃恢复”页面执行模拟重启，再继续键值操作。',
+  };
 
   const execute = (action: KvAction) => {
-    const seconds = ttl ? Number(ttl) : undefined;
-    const nextResult = onAction(action, key, value, seconds);
+    const nextResult = onAction(action, key, value);
     setResult(nextResult);
     if (action === 'GET' && nextResult.value !== undefined) setValue(nextResult.value);
   };
@@ -410,21 +394,20 @@ function KvOperations({
       <LabPanel className="command-panel">
         <LabPanelHeader icon={<KeyRound size={15} />} eyebrow="命令面板" title="键值基础操作" action={<LabStatusPill tone={online ? 'online' : 'offline'}>{online ? '可执行' : '连接已断开'}</LabStatusPill>} />
         <div className="form-stack">
-          <LabField label="键 Key" htmlFor="kv-key"><Input id="kv-key" value={key} onChange={(event) => setKey(event.target.value)} placeholder="例如 user:1001" /></LabField>
-          <LabField label="值 Value" htmlFor="kv-value"><Input id="kv-value" value={value} onChange={(event) => setValue(event.target.value)} placeholder="请输入字符串值" /></LabField>
-          <LabField className="ttl-field" label="过期时间 TTL（秒，可选）" htmlFor="kv-ttl"><Input id="kv-ttl" type="number" min="1" value={ttl} onChange={(event) => setTtl(event.target.value)} placeholder="不填写则永久有效" /></LabField>
+          <LabField label="键 Key" htmlFor="kv-key"><Input id="kv-key" value={key} disabled={!online} onChange={(event) => setKey(event.target.value)} placeholder="例如 user:1001" /></LabField>
+          <LabField label="值 Value" htmlFor="kv-value"><Input id="kv-value" value={value} disabled={!online} onChange={(event) => setValue(event.target.value)} placeholder="请输入字符串值" /></LabField>
         </div>
         <div className="kv-actions">
-          <LabButton tone="success" onClick={() => execute('SET')}><Plus /> 写入 SET</LabButton>
-          <LabButton tone="info" onClick={() => execute('GET')}><Search /> 读取 GET</LabButton>
-          <LabButton tone="danger" onClick={() => execute('DELETE')}><Trash2 /> 删除</LabButton>
-          <LabButton tone="secondary" onClick={() => execute('KEYS')}><List /> 查看全部键</LabButton>
+          <LabButton tone="success" disabled={!online} onClick={() => execute('SET')}><Plus /> 写入 SET</LabButton>
+          <LabButton tone="info" disabled={!online} onClick={() => execute('GET')}><Search /> 读取 GET</LabButton>
+          <LabButton tone="danger" disabled={!online} onClick={() => execute('DELETE')}><Trash2 /> 删除</LabButton>
+          <LabButton tone="secondary" disabled={!online} onClick={() => execute('KEYS')}><List /> 查看全部键</LabButton>
         </div>
-        <div className={`command-result ${result.kind}`} aria-live="polite">
-          <span>{result.kind === 'success' ? <CheckCircle2 /> : result.kind === 'error' ? <CircleAlert /> : <TerminalSquare />}</span>
-          <div><small>最近结果</small><strong>{result.title}</strong><p>{result.message}</p></div>
+        <div className={`command-result ${visibleResult.kind}`} aria-live="polite">
+          <span>{visibleResult.kind === 'success' ? <CheckCircle2 /> : visibleResult.kind === 'error' ? <CircleAlert /> : <TerminalSquare />}</span>
+          <div><small>最近结果</small><strong>{visibleResult.title}</strong><p>{visibleResult.message}</p></div>
         </div>
-        <div className="protocol-note secondary-detail"><code>{'>'} TCP JSON</code><span>所有交互均为本地原型模拟，不连接后端。</span></div>
+        <div className="protocol-note secondary-detail"><code>{'>'} LOCAL STATE</code><span>本页只更新浏览器内存，不发送 TCP 或 HTTP 请求。</span></div>
       </LabPanel>
 
       <LabPanel className="store-panel">
@@ -435,17 +418,13 @@ function KvOperations({
         </div>
         {visibleEntries.length ? (
           <div className={`key-cells ${view}`}>
-            {visibleEntries.map((entry) => {
-              const ttlLeft = entry.expiresAt ? Math.max(0, Math.ceil((entry.expiresAt - now) / 1000)) : null;
-              return (
-                <button key={entry.key} type="button" className={`key-cell ${ttlLeft !== null && ttlLeft <= 10 ? 'ttl-warning' : ''}`} onClick={() => selectEntry(entry)}>
+            {visibleEntries.map((entry) => (
+                <button key={entry.key} type="button" className="key-cell" onClick={() => selectEntry(entry)}>
                   <span><Database /><code>{entry.key}</code></span>
                   <strong>{entry.value}</strong>
-                  <small>{ttlLeft === null ? '永久保存' : `TTL ${ttlLeft} 秒`}</small>
-                  {ttlLeft !== null && <i style={{ '--ttl': `${Math.min(100, ttlLeft)}%` } as CSSProperties} />}
+                  <small>永久保存</small>
                 </button>
-              );
-            })}
+            ))}
           </div>
         ) : (
           <div className="empty-state"><Database /><strong>没有匹配的键</strong><p>修改搜索词，或用 SET 创建第一个键。</p></div>
@@ -456,9 +435,9 @@ function KvOperations({
       <LabPanel className="history-panel">
         <LabPanelHeader icon={<Clock3 size={15} />} eyebrow="操作历史" title="请求与响应" action={<span className="history-count">最近 {Math.min(8, operations.length)} 条</span>} />
         <div className="history-list">
-          {operations.slice(0, 8).map((row) => (
+          {operations.length ? operations.slice(0, 8).map((row) => (
             <div key={row.id}><span className={`history-op ${row.tone}`}>{row.op}</span><p><code>{row.detail}</code><small>{row.result} · {row.latency}</small></p><time>{row.time.slice(0, 8)}</time></div>
-          ))}
+          )) : <div className="empty-log">暂无本地操作记录。</div>}
         </div>
       </LabPanel>
     </section>
@@ -511,11 +490,11 @@ function ConcurrencyPage({
         <div className="config-group"><span>客户端数量</span><div className="preset-buttons">{[1, 10, 50, 100].map((value) => <button key={value} className={clients === value ? 'active' : ''} disabled={running} onClick={() => setClients(value)}>{value}</button>)}</div></div>
         <LabField className="number-config" label="每客户端请求数" htmlFor="requests-per-client"><Input id="requests-per-client" type="number" min="10" max="1000" value={requestsPerClient} disabled={running} onChange={(event) => setRequestsPerClient(Math.max(10, Number(event.target.value) || 10))} /></LabField>
         <div className="config-group"><span>负载类型</span><div className="segmented">{(['读取为主', '写入为主', '混合读写'] as Workload[]).map((item) => <button key={item} className={workload === item ? 'active' : ''} disabled={running} onClick={() => setWorkload(item)}>{item}</button>)}</div></div>
-        {running ? <LabButton variant="destructive" className="run-button" onClick={onStop}><Square /> 停止实验</LabButton> : <LabButton className="run-button" disabled={!online} onClick={onStart}><Play /> 开始并发实验</LabButton>}
+        {running ? <LabButton variant="destructive" className="run-button" onClick={onStop}><Square /> 停止模拟</LabButton> : <LabButton className="run-button" disabled={!online} onClick={onStart}><Play /> 开始本地模拟</LabButton>}
       </LabPanel>
 
       <LabPanel className="client-grid-card">
-        <LabPanelHeader icon={<Network size={15} />} eyebrow="客户端活动矩阵" title={`${clients} 个客户端并行工作`} action={<LabBadge variant="experiment" tone={status === 'IDLE' ? 'idle' : status === 'RUNNING' ? 'running' : status === 'COMPLETED' ? 'completed' : 'stopped'}>{status === 'IDLE' ? '准备就绪' : status === 'RUNNING' ? '运行中' : status === 'COMPLETED' ? '已完成' : '已停止'}</LabBadge>} />
+        <LabPanelHeader icon={<Network size={15} />} eyebrow="客户端活动矩阵 · 前端本地模拟" title={`${clients} 个虚拟客户端并行工作`} action={<LabBadge variant="experiment" tone={status === 'IDLE' ? 'idle' : status === 'RUNNING' ? 'running' : status === 'COMPLETED' ? 'completed' : 'stopped'}>{status === 'IDLE' ? '准备就绪' : status === 'RUNNING' ? '模拟中' : status === 'COMPLETED' ? '模拟完成' : status === 'INTERRUPTED' ? '已中断' : '已停止'}</LabBadge>} />
         <div className="client-legend"><span><i className="read" />读取</span><span><i className="write" />写入</span><span><i className="delete" />删除</span><span><i className="idle" />等待</span></div>
         <div className={`client-grid ${running ? 'is-running' : ''}`} style={{ gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))` }}>
           {renderedClients.map((index) => {
@@ -533,11 +512,11 @@ function ConcurrencyPage({
       <LabPanel className="concurrency-result">
         <LabPanelHeader icon={<Gauge size={15} />} eyebrow="实时结果" title="请求完成情况" />
         <div className="progress-ring" style={{ '--progress': `${progress * 3.6}deg` } as CSSProperties}><div><strong>{Math.round(progress)}%</strong><span>{formatNumber(currentCompleted)} / {formatNumber(total)}</span></div></div>
-        <div className="result-kpis"><div><span>成功</span><strong className="success-text">{formatNumber(successful)}</strong></div><div><span>失败</span><strong className={failed ? 'danger-text' : ''}>{formatNumber(failed)}</strong></div><div><span>实时吞吐</span><strong>{formatNumber(throughput)}<small> 请求/秒</small></strong></div><div><span>已用时间</span><strong>{elapsed.toFixed(1)}<small> 秒</small></strong></div></div>
+        <div className="result-kpis"><div><span>成功</span><strong className="success-text">{formatNumber(successful)}</strong></div><div><span>失败</span><strong className={failed ? 'danger-text' : ''}>{formatNumber(failed)}</strong></div><div><span>模拟吞吐</span><strong>{formatNumber(throughput)}<small> 请求/秒</small></strong></div><div><span>已用时间</span><strong>{elapsed.toFixed(1)}<small> 秒</small></strong></div></div>
         <LabProgress value={progress} className="experiment-progress" />
-        <div className={`verdict-strip ${status === 'COMPLETED' ? 'pass' : status === 'STOPPED' ? 'stopped' : ''}`}>
-          {status === 'COMPLETED' ? <CheckCircle2 /> : status === 'STOPPED' ? <Pause /> : <Activity />}
-          <div><strong>{status === 'COMPLETED' ? '并发一致性通过' : status === 'STOPPED' ? '实验已手动停止' : running ? '并发请求正在执行' : online ? '参数就绪，等待开始' : '服务离线，无法开始'}</strong><span>{status === 'COMPLETED' ? '全部客户端共享同一存储，未发现数据竞争。' : '运行中可以切换页面，实验状态不会丢失。'}</span></div>
+        <div className={`verdict-strip ${status === 'COMPLETED' ? 'pass' : status === 'STOPPED' || status === 'INTERRUPTED' ? 'stopped' : ''}`}>
+          {status === 'COMPLETED' ? <CheckCircle2 /> : status === 'STOPPED' || status === 'INTERRUPTED' ? <Pause /> : <Activity />}
+          <div><strong>{status === 'COMPLETED' ? '本地并发流程模拟完成' : status === 'STOPPED' ? '模拟已手动停止' : status === 'INTERRUPTED' ? '服务离线，模拟已中断' : running ? '虚拟请求正在执行' : online ? '参数就绪，等待开始' : '服务离线，无法开始'}</strong><span>{status === 'COMPLETED' ? '结果仅用于展示前端流程，不代表真实并发测试结论。' : status === 'INTERRUPTED' ? '已完成统计会保留，模拟服务恢复后可重新运行。' : '运行中可以切换页面，前端状态不会丢失。'}</span></div>
         </div>
       </LabPanel>
     </section>
@@ -606,19 +585,19 @@ function RecoveryPage({
       </div>
 
       <LabPanel className="recovery-control">
-        <LabPanelHeader icon={<ShieldAlert size={15} />} eyebrow="断电实验控制" title="亲手杀掉，再重新启动" action={<LabStatusPill tone={serverState === 'ONLINE' ? 'online' : serverState === 'OFFLINE' ? 'offline' : 'warning'}>{serverLabels[serverState].label}</LabStatusPill>} />
-        <div className="seed-presets"><span>写入测试数据</span><div>{[50, 100, 500, 1000].map((value) => <button key={value} className={seedCount === value ? 'active' : ''} disabled={phase === 'RECOVERING'} onClick={() => setSeedCount(value)}>{value} 键</button>)}</div></div>
-        <div className="failure-toggle"><div><strong>故障注入</strong><small>恢复时故意丢失 2 个键，用于展示 FAIL 状态</small></div><Switch checked={injectFailure} onCheckedChange={setInjectFailure} disabled={phase === 'RECOVERING' || phase === 'CRASHED'} /></div>
+        <LabPanelHeader icon={<ShieldAlert size={15} />} eyebrow="断电实验控制 · 前端本地模拟" title="切换状态，再演示恢复流程" action={<LabStatusPill tone={serverState === 'ONLINE' ? 'online' : serverState === 'OFFLINE' ? 'offline' : 'warning'}>{serverLabels[serverState].label}</LabStatusPill>} />
+        <div className="seed-presets"><span>准备演示数据</span><div>{[50, 100, 500, 1000].map((value) => <button key={value} className={seedCount === value ? 'active' : ''} disabled={serverState !== 'ONLINE' || phase === 'RECOVERING'} onClick={() => setSeedCount(value)}>{value} 键</button>)}</div></div>
+        <div className="failure-toggle"><div><strong>故障注入</strong><small>仅让恢复后的前端快照少 2 个键，用于展示 FAIL</small></div><Switch aria-label="故障注入" checked={injectFailure} onCheckedChange={setInjectFailure} disabled={phase === 'RECOVERING' || phase === 'CRASHED'} /></div>
         <div className="recovery-actions">
-          <LabButton variant="secondary" disabled={serverState !== 'ONLINE' || phase === 'RECOVERING'} onClick={onSeed}><Database /> ① 写入并记录快照</LabButton>
-          <LabButton variant="destructive" className="kill-button" disabled={phase !== 'PREPARED' || serverState !== 'ONLINE'} onClick={onKill}><Zap /> ② 强制终止服务</LabButton>
-          <LabButton className="restart-button" disabled={phase !== 'CRASHED'} onClick={onRestart}><RefreshCcw /> ③ 重启并重放 WAL</LabButton>
+          <LabButton variant="secondary" disabled={serverState !== 'ONLINE' || phase === 'RECOVERING'} onClick={onSeed}><Database /> ① 写入本地快照</LabButton>
+          <LabButton variant="destructive" className="kill-button" disabled={phase !== 'PREPARED' || serverState !== 'ONLINE'} onClick={onKill}><Zap /> ② 模拟强制终止</LabButton>
+          <LabButton className="restart-button" disabled={phase !== 'CRASHED'} onClick={onRestart}><RefreshCcw /> ③ 模拟重启与重放</LabButton>
         </div>
-        <div className="power-explainer"><div className={serverState === 'OFFLINE' ? 'lost' : ''}><HardDrive /><span>内存中的键</span><strong>{serverState === 'OFFLINE' ? 0 : phase === 'RECOVERING' ? recoveredCount : currentEntries.length}</strong></div><ArrowRight /><div className="safe"><FileClock /><span>磁盘 WAL</span><strong>仍然存在 ✓</strong></div></div>
+        <div className="power-explainer"><div className={serverState === 'OFFLINE' ? 'lost' : ''}><HardDrive /><span>页面内存中的键</span><strong>{serverState === 'OFFLINE' ? 0 : phase === 'RECOVERING' ? recoveredCount : currentEntries.length}</strong></div><ArrowRight /><div className="safe"><FileClock /><span>本地演示快照</span><strong>仍然保留 ✓</strong></div></div>
       </LabPanel>
 
       <LabPanel className={`recovery-proof ${verified ? (pass ? 'proof-pass' : 'proof-fail') : ''}`}>
-        <LabPanelHeader icon={<ShieldCheck size={15} />} eyebrow="核心证明" title="重启以后，数据仍然对吗？" action={verified ? <LabBadge variant="proof" tone={pass ? 'pass' : 'fail'}>{pass ? '校验通过' : '发现不一致'}</LabBadge> : <LabBadge variant="proof" tone="waiting">等待实验</LabBadge>} />
+        <LabPanelHeader icon={<ShieldCheck size={15} />} eyebrow="本地校验演示" title="恢复后的前端快照仍然一致吗？" action={verified ? <LabBadge variant="proof" tone={pass ? 'pass' : 'fail'}>{pass ? '模拟通过' : '发现不一致'}</LabBadge> : <LabBadge variant="proof" tone="waiting">等待实验</LabBadge>} />
         <div className="before-after">
           <div><span>崩溃前</span><strong>{formatNumber(beforeDisplay)}</strong><small>内存键</small></div>
           <ArrowRight />
@@ -640,7 +619,7 @@ function RecoveryPage({
       </LabPanel>
 
       <LabPanel className="replay-panel">
-        <LabPanelHeader icon={<TerminalSquare size={15} />} eyebrow="WAL 重放" title="恢复过程实时可见" action={<span className="replay-percent">{Math.round(progress)}%</span>} />
+        <LabPanelHeader icon={<TerminalSquare size={15} />} eyebrow="WAL 重放动画" title="前端演示进度" action={<span className="replay-percent">{Math.round(progress)}%</span>} />
         <LabProgress value={progress} className="replay-progress" />
         <div className="replay-counter"><span>已恢复</span><strong>{formatNumber(phase === 'RECOVERING' ? recoveredCount : verified ? currentEntries.length : 0)}</strong><small>/ {formatNumber(beforeDisplay)} 键</small></div>
         <div className="replay-log">
@@ -649,13 +628,13 @@ function RecoveryPage({
       </LabPanel>
 
       <LabPanel className="compact-panel">
-        <LabPanelHeader icon={<FileClock size={15} />} eyebrow="WAL 压缩" title="日志会增长，但可以安全压缩" action={<LabButton variant="outline" disabled={compactRunning || serverState !== 'ONLINE'} onClick={onCompact}>{compactRunning ? <Activity /> : <Sparkles />}{compactRunning ? '正在压缩' : '运行 Compact'}</LabButton>} />
+        <LabPanelHeader icon={<FileClock size={15} />} eyebrow="WAL 压缩 · 扩展预留" title="前端本地模拟，不修改真实文件" action={<LabButton variant="outline" disabled={compactRunning || serverState !== 'ONLINE'} onClick={onCompact}>{compactRunning ? <Activity /> : <Sparkles />}{compactRunning ? '正在模拟' : '模拟 Compact'}</LabButton>} />
         <div className="compact-compare">
           <div><span>压缩前</span><strong>{formatNumber(compactResult?.beforeRecords ?? INITIAL_WAL_RECORDS)} 条</strong><i><b style={{ width: '92%' }} /></i><small>{formatBytes(compactResult?.beforeBytes ?? INITIAL_WAL_BYTES)}</small></div>
           <ArrowRight />
           <div><span>压缩后</span><strong>{compactResult ? formatNumber(compactResult.afterRecords) : '—'} 条</strong><i><b className="after" style={{ width: compactResult ? `${Math.max(7, (compactResult.afterBytes / compactResult.beforeBytes) * 100)}%` : '7%' }} /></i><small>{compactResult ? formatBytes(compactResult.afterBytes) : '等待执行'}</small></div>
         </div>
-        <div className="compact-progress"><LabProgress value={compactProgress} /><span>{compactRunning ? `构建快照并原子替换 · ${Math.round(compactProgress)}%` : compactResult ? `体积减少 ${Math.round((1 - compactResult.afterBytes / compactResult.beforeBytes) * 100)}% · 一致性通过` : 'Build → Flush/Sync → Replace → Verify'}</span></div>
+        <div className="compact-progress"><LabProgress value={compactProgress} /><span>{compactRunning ? `模拟构建快照与原子替换 · ${Math.round(compactProgress)}%` : compactResult ? `模拟体积减少 ${Math.round((1 - compactResult.afterBytes / compactResult.beforeBytes) * 100)}% · 前端流程完成` : '本地模拟：Build → Flush/Sync → Replace → Verify'}</span></div>
       </LabPanel>
     </section>
   );
@@ -692,23 +671,23 @@ function PerformancePage({
   return (
     <section className="performance-page lab-page">
       <LabPanel className="benchmark-config">
-        <div><span className="panel-kicker"><Gauge size={15} /> 基准测试参数</span><h2>测量不同并发规模下的吞吐与尾延迟</h2></div>
+        <div><span className="panel-kicker"><Gauge size={15} /> 性能演示参数</span><h2>生成不同并发规模下的前端演示数据</h2></div>
         <div className="config-group"><span>并发规模</span><div className="preset-buttons">{[1, 10, 50, 100].map((value) => <button key={value} className={scales.includes(value) ? 'active' : ''} disabled={running} onClick={() => toggleScale(value)}>{value}</button>)}</div></div>
         <div className="config-group"><span>负载类型</span><div className="segmented">{(['读取为主', '写入为主', '混合读写'] as Workload[]).map((item) => <button key={item} className={workload === item ? 'active' : ''} disabled={running} onClick={() => setWorkload(item)}>{item}</button>)}</div></div>
-        <div className="request-summary"><span>每组请求</span><strong>10,000</strong><small>预计约 4 秒</small></div>
-        {running ? <LabButton variant="destructive" onClick={onStop}><Pause /> 停止并保留结果</LabButton> : <LabButton disabled={!online || !scales.length} onClick={onStart}><Play /> 运行基准测试</LabButton>}
+        <div className="request-summary"><span>每组虚拟请求</span><strong>10,000</strong><small>约 4 秒演示</small></div>
+        {running ? <LabButton variant="destructive" onClick={onStop}><Pause /> 停止并保留结果</LabButton> : <LabButton disabled={!online || !scales.length} onClick={onStart}><Play /> 运行本地模拟</LabButton>}
       </LabPanel>
 
       <div className="benchmark-kpis">
-        <div><span>峰值吞吐</span><strong>{peak ? formatNumber(peak.qps) : '—'}<small> 请求/秒</small></strong><em>{peak ? `${peak.clients} 客户端` : '暂无数据'}</em></div>
+        <div><span>模拟峰值吞吐</span><strong>{peak ? formatNumber(peak.qps) : '—'}<small> 请求/秒</small></strong><em>{peak ? `${peak.clients} 客户端` : '暂无数据'}</em></div>
         <div><span>并发甜点</span><strong>{peak?.clients ?? '—'}<small> 客户端</small></strong><em>吞吐最高点</em></div>
         <div><span>最低 P99</span><strong>{bestP99 ? bestP99.toFixed(1) : '—'}<small> ms</small></strong><em>尾延迟</em></div>
         <div><span>成功率</span><strong>{results.length ? Math.min(...results.map((point) => point.success)).toFixed(2) : '—'}<small>%</small></strong><em>{status === 'INTERRUPTED' ? '测试被中断' : '所有已完成规模'}</em></div>
-        <div className="benchmark-progress"><span>{running ? '测试进行中' : status === 'COMPLETED' ? '测试完成' : status === 'INTERRUPTED' ? '已保留完成点' : '历史结果'}</span><strong>{Math.round(progress)}%</strong><LabProgress value={progress} /></div>
+        <div className="benchmark-progress"><span>{running ? '模拟进行中' : status === 'COMPLETED' ? '模拟完成' : status === 'INTERRUPTED' ? '已保留完成点' : '等待运行'}</span><strong>{Math.round(progress)}%</strong><LabProgress value={progress} /></div>
       </div>
 
       <LabPanel className="throughput-chart-card">
-        <LabPanelHeader icon={<Activity size={15} />} eyebrow="吞吐量" title="客户端数量 vs 每秒请求数" action={peak && <span className="sweet-spot">甜点：{peak.clients} 客户端</span>} />
+        <LabPanelHeader icon={<Activity size={15} />} eyebrow="吞吐量 · 前端本地模拟" title="客户端数量 vs 每秒请求数" action={<span className="prototype-label">非实测数据</span>} />
         {results.length ? (
           <ChartContainer config={throughputChartConfig} className="benchmark-chart" initialDimension={{ width: 640, height: 270 }}>
             <BarChart data={results} margin={{ top: 18, right: 12, bottom: 0, left: 0 }}>
@@ -719,11 +698,11 @@ function PerformancePage({
               <Bar dataKey="qps" fill="var(--color-qps)" radius={[5, 5, 0, 0]} />
             </BarChart>
           </ChartContainer>
-        ) : <div className="empty-state chart-empty"><Gauge /><strong>正在生成吞吐量数据点</strong><p>每完成一个并发规模，柱形会立即出现。</p></div>}
+        ) : <div className="empty-state chart-empty"><Gauge /><strong>等待运行本地模拟</strong><p>每完成一个并发规模，演示数据点会立即出现。</p></div>}
       </LabPanel>
 
       <LabPanel className="latency-chart-card">
-        <LabPanelHeader icon={<Clock3 size={15} />} eyebrow="延迟分位" title="P50 / P95 / P99 尾延迟" action={<span className="latency-unit">单位：毫秒</span>} />
+        <LabPanelHeader icon={<Clock3 size={15} />} eyebrow="延迟分位 · 前端本地模拟" title="P50 / P95 / P99 尾延迟" action={<span className="latency-unit">单位：毫秒</span>} />
         {results.length ? (
           <ChartContainer config={latencyChartConfig} className="benchmark-chart" initialDimension={{ width: 540, height: 270 }}>
             <LineChart data={results} margin={{ top: 18, right: 14, bottom: 0, left: 0 }}>
@@ -741,9 +720,9 @@ function PerformancePage({
       </LabPanel>
 
       <LabPanel className="workload-insight">
-        <LabPanelHeader icon={<Sparkles size={15} />} eyebrow="结果解读" title="老师一眼能讲清楚的结论" />
-        <div className="insight-flow"><div><span>1 客户端</span><i style={{ width: '18%' }} /><small>并行度不足</small></div><div className="best"><span>50 客户端</span><i style={{ width: '88%' }} /><small>吞吐峰值</small></div><div><span>100 客户端</span><i style={{ width: '78%' }} /><small>P99 开始上升</small></div></div>
-        <p>写操作需要进入共享临界区，同时 WAL 会执行持久化同步，因此并发继续增大后吞吐不会无限增长。</p>
+        <LabPanelHeader icon={<Sparkles size={15} />} eyebrow="结果解读" title="只解读本次已生成的数据点" action={<span className="prototype-label">非后端结论</span>} />
+        {results.length ? <div className="insight-flow">{results.map((point) => <div key={point.clients} className={point.clients === peak?.clients ? 'best' : ''}><span>{point.clients} 客户端</span><i style={{ width: `${Math.max(8, point.qps / (peak?.qps ?? point.qps) * 88)}%` }} /><small>{point.clients === peak?.clients ? '模拟峰值' : `P99 ${point.p99.toFixed(1)} ms`}</small></div>)}</div> : <div className="empty-state"><Sparkles /><strong>暂无可解读结果</strong><p>运行本地模拟后再生成结论。</p></div>}
+        <p>{results.length ? '这些数值由前端模板生成，只用于验证图表、停止与保留结果等交互，不代表真实 RustKV 性能。' : '本页不会在未运行时展示预置结果，也不会把模拟值标成实测。'}</p>
       </LabPanel>
     </section>
   );
@@ -781,18 +760,18 @@ function PubSubPage({
         <LabPanelHeader icon={<Radio size={15} />} eyebrow="发布订阅实验区" title="一条消息，推送给多个订阅者" action={<span className="prototype-label">前端本地模拟 · 扩展预留</span>} />
         <div className={`message-stage ${publishing ? 'is-publishing' : ''}`}>
           <div className="subscriber-zone">
-            <div className="zone-title"><span>订阅者</span><LabButton variant="ghost" size="sm" onClick={onAddSubscriber} disabled={subscribers.length >= 4}><Plus /> 添加</LabButton></div>
+            <div className="zone-title"><span>订阅者</span><LabButton variant="ghost" size="sm" onClick={onAddSubscriber} disabled={!online || publishing || subscribers.length >= 4}><Plus /> 添加</LabButton></div>
             {subscribers.map((subscriber) => (
               <div key={subscriber.id} className={`subscriber-card ${subscriber.active && online ? 'listening' : 'disconnected'}`}>
                 <div><Bell /><span><strong>{subscriber.name}</strong><small>{subscriber.active && online ? `正在监听 #${channel}` : online ? '已取消订阅' : '连接已断开'}</small></span></div>
-                <LabButton variant="ghost" size="xs" onClick={() => onToggleSubscriber(subscriber.id)}>{subscriber.active ? '取消' : '订阅'}</LabButton>
+                <LabButton variant="ghost" size="xs" disabled={!online || publishing} onClick={() => onToggleSubscriber(subscriber.id)}>{subscriber.active ? '取消' : '订阅'}</LabButton>
                 <p>{subscriber.received[0] ? `收到：“${subscriber.received[0]}”` : '等待第一条消息…'}</p>
               </div>
             ))}
           </div>
 
           <div className="broker-zone">
-            <div className={`broker-node ${online ? 'online' : 'offline'}`}><Server /><strong>RustKV Broker</strong><span>{online ? '正在路由消息' : '服务离线'}</span><code>#{channel}</code></div>
+            <div className={`broker-node ${online ? 'online' : 'offline'}`}><Server /><strong>RustKV Broker（模拟）</strong><span>{online ? '正在演示消息路由' : '服务离线'}</span><code>#{channel}</code></div>
             <div className="broker-lines"><i /><i /><i /></div>
             {publishing && <div className="flying-message"><MessageSquare /><span>{message}</span></div>}
           </div>
@@ -800,8 +779,8 @@ function PubSubPage({
           <div className="publisher-zone">
             <span className="zone-label">发布者</span>
             <div className="publisher-card"><Send /><strong>消息发布面板</strong><small>Publisher → Broker → Subscribers</small></div>
-          <LabField label="频道 Channel" htmlFor="pubsub-channel"><Input id="pubsub-channel" value={channel} onChange={(event) => setChannel(event.target.value.replace(/\s/g, ''))} placeholder="news" /></LabField>
-          <LabField label="消息 Message" htmlFor="pubsub-message"><Input id="pubsub-message" value={message} onChange={(event) => setMessage(event.target.value)} placeholder="Hello Rust" /></LabField>
+          <LabField label="频道 Channel" htmlFor="pubsub-channel"><Input id="pubsub-channel" value={channel} disabled={!online || publishing} onChange={(event) => setChannel(event.target.value.replace(/\s/g, ''))} placeholder="news" /></LabField>
+          <LabField label="消息 Message" htmlFor="pubsub-message"><Input id="pubsub-message" value={message} disabled={!online || publishing} onChange={(event) => setMessage(event.target.value)} placeholder="Hello Rust" /></LabField>
           <LabButton className="publish-button" disabled={!online || publishing || !message.trim() || !channel.trim()} onClick={onPublish}><Send /> {publishing ? '正在推送…' : '发布消息'}</LabButton>
           </div>
         </div>
@@ -820,7 +799,7 @@ function PubSubPage({
 function makeBenchmarkData(workload: Workload): BenchmarkPoint[] {
   const qpsFactor = workload === '读取为主' ? 1.14 : workload === '写入为主' ? 0.76 : 1;
   const latencyFactor = workload === '读取为主' ? 0.82 : workload === '写入为主' ? 1.36 : 1;
-  return baselineBenchmark.map((point) => ({
+  return simulationBenchmarkTemplate.map((point) => ({
     ...point,
     qps: Math.round(point.qps * qpsFactor),
     p50: Number((point.p50 * latencyFactor).toFixed(2)),
@@ -838,10 +817,7 @@ export default function Home() {
   const [entries, setEntries] = useState<KvEntry[]>(makeInitialEntries);
   const [walRecords, setWalRecords] = useState(INITIAL_WAL_RECORDS);
   const [walBytes, setWalBytes] = useState(INITIAL_WAL_BYTES);
-  const [totalRequests, setTotalRequests] = useState(1_281_440);
-  const [failedRequests, setFailedRequests] = useState(246);
   const [operations, setOperations] = useState<OperationLog[]>(initialOperations);
-  const [now, setNow] = useState(0);
 
   const [concurrencyClients, setConcurrencyClients] = useState(100);
   const [requestsPerClient, setRequestsPerClient] = useState(100);
@@ -870,9 +846,9 @@ export default function Home() {
 
   const [benchmarkScales, setBenchmarkScales] = useState([1, 10, 50, 100]);
   const [benchmarkWorkload, setBenchmarkWorkload] = useState<Workload>('混合读写');
-  const [benchmarkStatus, setBenchmarkStatus] = useState<ExperimentStatus>('COMPLETED');
-  const [benchmarkProgress, setBenchmarkProgress] = useState(100);
-  const [benchmarkResults, setBenchmarkResults] = useState<BenchmarkPoint[]>(baselineBenchmark);
+  const [benchmarkStatus, setBenchmarkStatus] = useState<ExperimentStatus>('IDLE');
+  const [benchmarkProgress, setBenchmarkProgress] = useState(0);
+  const [benchmarkResults, setBenchmarkResults] = useState<BenchmarkPoint[]>([]);
 
   const [subscribers, setSubscribers] = useState<Subscriber[]>([
     { id: 1, name: 'Subscriber A', active: true, received: [] },
@@ -884,7 +860,7 @@ export default function Home() {
   const [publishing, setPublishing] = useState(false);
   const [pubsubLogs, setPubsubLogs] = useState(['[READY] 发布订阅原型已就绪', '[SUB] Subscriber A → #news', '[SUB] Subscriber B → #news']);
 
-  const logIdRef = useRef(10);
+  const logIdRef = useRef(0);
   const concurrencyTimerRef = useRef<number | null>(null);
   const recoveryTimerRef = useRef<number | null>(null);
   const compactTimerRef = useRef<number | null>(null);
@@ -897,23 +873,11 @@ export default function Home() {
     timerRef.current = null;
   };
 
-  const addOperation = useCallback((op: string, detail: string, tone: OperationTone, result: string, latency = '0.8ms') => {
+  const addOperation = useCallback((op: string, detail: string, tone: OperationTone, result: string, latency = '—') => {
     logIdRef.current += 1;
     const next: OperationLog = { id: logIdRef.current, time: formatClock(), op, detail, latency, tone, result };
     setOperations((previous) => [next, ...previous].slice(0, 20));
     setLastUpdate(formatClock().slice(0, 8));
-  }, []);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      const timestamp = Date.now();
-      setNow(timestamp);
-      setEntries((previous) => {
-        const expired = previous.some((entry) => entry.expiresAt !== undefined && entry.expiresAt <= timestamp);
-        return expired ? previous.filter((entry) => entry.expiresAt === undefined || entry.expiresAt > timestamp) : previous;
-      });
-    }, 1000);
-    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => () => {
@@ -924,55 +888,54 @@ export default function Home() {
     if (publishTimerRef.current !== null) window.clearTimeout(publishTimerRef.current);
   }, []);
 
-  const performKvAction = (action: KvAction, key: string, value: string, ttlSeconds?: number): KvResult => {
-    setTotalRequests((count) => count + 1);
+  const performKvAction = (action: KvAction, key: string, value: string): KvResult => {
     if (serverState !== 'ONLINE') {
-      setFailedRequests((count) => count + 1);
       addOperation(action, key || '(empty)', 'error', '连接失败', '—');
       return { kind: 'error', title: '连接失败', message: 'RustKV 服务当前离线。请先在“崩溃恢复”页面重启服务。' };
     }
-    if (action !== 'KEYS' && !key.trim()) {
-      setFailedRequests((count) => count + 1);
-      return { kind: 'error', title: '键不能为空', message: '请输入一个非空 Key 后再执行。' };
+    if (action !== 'KEYS') {
+      const keyError = validateKey(key);
+      if (keyError) {
+        addOperation(action, key || '(empty)', 'error', keyError.title, '—');
+        return keyError;
+      }
     }
-    const normalizedKey = key.trim();
+    const normalizedKey = key;
     const existing = entries.find((entry) => entry.key === normalizedKey);
 
     if (action === 'SET') {
-      if (!value.trim()) {
-        setFailedRequests((count) => count + 1);
-        return { kind: 'error', title: '值不能为空', message: '请输入要写入的字符串 Value。' };
+      const valueError = validateValue(value);
+      if (valueError) {
+        addOperation('SET', normalizedKey, 'error', valueError.title, '—');
+        return valueError;
       }
-      const expiresAt = ttlSeconds && ttlSeconds > 0 ? Date.now() + ttlSeconds * 1000 : undefined;
-      setEntries((previous) => existing ? previous.map((entry) => entry.key === normalizedKey ? { key: normalizedKey, value, expiresAt } : entry) : [{ key: normalizedKey, value, expiresAt }, ...previous]);
+      setEntries((previous) => existing ? previous.map((entry) => entry.key === normalizedKey ? { key: normalizedKey, value } : entry) : [{ key: normalizedKey, value }, ...previous]);
       setWalRecords((count) => count + 1);
-      setWalBytes((bytes) => bytes + normalizedKey.length + value.length + 24);
-      addOperation('SET', normalizedKey, 'write', existing ? '已更新' : '已创建', '1.1ms');
-      return { kind: 'success', title: existing ? '写入成功 · 已更新' : '写入成功 · 已创建', message: ttlSeconds ? `键将在 ${ttlSeconds} 秒后过期。` : '该键已先写入 WAL，再更新内存。' };
+      setWalBytes((bytes) => bytes + textEncoder.encode(normalizedKey).length + textEncoder.encode(value).length + 24);
+      addOperation('SET', normalizedKey, 'write', existing ? '本地已更新' : '本地已创建', '—');
+      return { kind: 'success', title: existing ? '本地写入成功 · 已更新' : '本地写入成功 · 已创建', message: '浏览器内存中的键值已更新；本次未发送后端请求。' };
     }
     if (action === 'GET') {
       if (!existing) {
-        setFailedRequests((count) => count + 1);
-        addOperation('GET', normalizedKey, 'read', '未找到', '0.5ms');
+        addOperation('GET', normalizedKey, 'read', '本地未找到', '—');
         return { kind: 'error', title: '未找到 NOT_FOUND', message: `存储中不存在键“${normalizedKey}”。` };
       }
-      addOperation('GET', normalizedKey, 'read', '命中', '0.5ms');
-      return { kind: 'success', title: '读取成功', message: `已返回 ${existing.value.length} 个字符。`, value: existing.value };
+      addOperation('GET', normalizedKey, 'read', '本地命中', '—');
+      return { kind: 'success', title: '本地读取成功', message: `已从浏览器内存返回 ${existing.value.length} 个字符。`, value: existing.value };
     }
     if (action === 'DELETE') {
       if (!existing) {
-        setFailedRequests((count) => count + 1);
-        addOperation('DEL', normalizedKey, 'delete', '未找到', '0.7ms');
+        addOperation('DEL', normalizedKey, 'delete', '本地未找到', '—');
         return { kind: 'error', title: '删除失败 · 未找到', message: `键“${normalizedKey}”不存在，存储未发生变化。` };
       }
       setEntries((previous) => previous.filter((entry) => entry.key !== normalizedKey));
       setWalRecords((count) => count + 1);
-      setWalBytes((bytes) => bytes + normalizedKey.length + 18);
-      addOperation('DEL', normalizedKey, 'delete', '成功', '0.9ms');
-      return { kind: 'success', title: '删除成功', message: '删除记录已持久化到 WAL。' };
+      setWalBytes((bytes) => bytes + textEncoder.encode(normalizedKey).length + 18);
+      addOperation('DEL', normalizedKey, 'delete', '本地删除', '—');
+      return { kind: 'success', title: '本地删除成功', message: '浏览器内存中的记录已删除；本次未修改真实 WAL。' };
     }
-    addOperation('KEYS', '*', 'system', `${entries.length} 个键`, '1.8ms');
-    return { kind: 'info', title: `共有 ${formatNumber(entries.length)} 个键`, message: '右侧存储视图已分页展示，可通过搜索快速定位。' };
+    addOperation('KEYS', '*', 'system', `${entries.length} 个本地键`, '—');
+    return { kind: 'info', title: `共有 ${formatNumber(entries.length)} 个本地键`, message: '右侧存储视图已分页展示，可通过搜索快速定位。' };
   };
 
   const startConcurrency = () => {
@@ -999,10 +962,7 @@ export default function Home() {
         clearTimer(concurrencyTimerRef);
         setConcurrencyStatus('COMPLETED');
         setConcurrencyThroughput(expectedThroughput);
-        setTotalRequests((count) => count + total);
-        setWalRecords((count) => count + Math.round(total * (concurrencyWorkload === '读取为主' ? 0.2 : concurrencyWorkload === '写入为主' ? 0.8 : 0.5)));
-        setWalBytes((bytes) => bytes + total * 22);
-        addOperation('LOAD', `${concurrencyClients} clients`, 'system', '并发通过', '3.8s');
+        addOperation('LOAD', `${concurrencyClients} virtual clients`, 'system', '本地模拟完成', '约 3.8s');
       }
     }, 95);
   };
@@ -1010,7 +970,7 @@ export default function Home() {
   const stopConcurrency = () => {
     clearTimer(concurrencyTimerRef);
     setConcurrencyStatus('STOPPED');
-    addOperation('STOP', `${concurrencyClients} clients`, 'system', '已停止', '—');
+    addOperation('STOP', `${concurrencyClients} virtual clients`, 'system', '本地模拟已停止', '—');
   };
 
   const seedRecoveryData = () => {
@@ -1031,11 +991,10 @@ export default function Home() {
     setRecoveryLost(0);
     setRecoveryProgress(0);
     setRecoveryPhase('PREPARED');
-    setRecoveryLogs([`[SEED] 写入 ${recoverySeedCount} 个测试键`, `[SYNC] WAL 已 flush + sync_data`, `[SNAPSHOT] 崩溃前 ${next.length} 个键 · ${fingerprintFor(next)}`]);
+    setRecoveryLogs([`[SEED] 写入 ${recoverySeedCount} 个本地测试键`, '[SIM] 未连接后端；以下为 WAL 流程演示', `[SNAPSHOT] 模拟崩溃前 ${next.length} 个键 · ${fingerprintFor(next)}`]);
     setWalRecords((count) => count + recoverySeedCount);
     setWalBytes((bytes) => bytes + recoverySeedCount * 64);
-    setTotalRequests((count) => count + recoverySeedCount);
-    addOperation('SEED', `${recoverySeedCount} keys`, 'write', '快照完成', '42ms');
+    addOperation('SEED', `${recoverySeedCount} local keys`, 'write', '本地快照完成', '—');
   };
 
   const killServer = () => {
@@ -1047,14 +1006,28 @@ export default function Home() {
     setServerState('OFFLINE');
     setRecoveryPhase('CRASHED');
     setRecoveredCount(0);
-    setRecoveryLogs((previous) => [...previous, '[KILL] 服务进程被强制终止', '[MEMORY] BTreeMap 已丢失 · 0 keys', '[DISK] WAL 文件仍完整保留']);
+    setRecoveryLogs((previous) => [...previous, '[KILL] 前端模拟服务状态切换为离线', '[MEMORY] 页面键集合已清空 · 0 keys', '[SNAPSHOT] 本地演示快照仍完整保留']);
     setLastUpdate(formatClock().slice(0, 8));
-    if (concurrencyStatus === 'RUNNING') stopConcurrency();
+    if (concurrencyStatus === 'RUNNING') {
+      clearTimer(concurrencyTimerRef);
+      setConcurrencyStatus('INTERRUPTED');
+      addOperation('STOP', `${concurrencyClients} virtual clients`, 'error', '离线中断', '—');
+    }
     if (benchmarkStatus === 'RUNNING') {
       clearTimer(benchmarkTimerRef);
       setBenchmarkStatus('INTERRUPTED');
     }
-    addOperation('KILL', 'rustkv-server', 'error', '服务离线', '—');
+    if (compactRunning) {
+      clearTimer(compactTimerRef);
+      setCompactRunning(false);
+    }
+    if (publishTimerRef.current !== null) {
+      window.clearTimeout(publishTimerRef.current);
+      publishTimerRef.current = null;
+      setPublishing(false);
+      setPubsubLogs((previous) => [...previous, '[STOP] 服务离线，发布演示已取消']);
+    }
+    addOperation('KILL', 'local demo state', 'error', '模拟离线', '—');
   };
 
   const restartServer = () => {
@@ -1063,7 +1036,7 @@ export default function Home() {
     setServerState('RECOVERING');
     setRecoveryPhase('RECOVERING');
     setRecoveryProgress(0);
-    setRecoveryLogs((previous) => [...previous, '[BOOT] RustKV 进程重新启动', '[OPEN] 打开 rustkv.wal', '[REPLAY] 开始顺序重放日志记录']);
+    setRecoveryLogs((previous) => [...previous, '[BOOT] 前端模拟进入恢复状态', '[OPEN] 读取本地演示快照', '[REPLAY] 开始播放 WAL 重放动画']);
     const snapshot = recoverySnapshotRef.current.map((entry) => ({ ...entry }));
     let step = 0;
     const announced = new Set<number>();
@@ -1091,7 +1064,7 @@ export default function Home() {
         setRecoveryPhase('VERIFIED');
         setRecoveryLogs((previous) => [...previous, `[VERIFY] 恢复 ${restored.length}/${snapshot.length} 个键`, `[HASH] ${fingerprintFor(restored)}`, lost ? `[FAIL] 检测到 ${lost} 个键丢失` : '[PASS] 数量、抽样值、数据指纹全部一致']);
         setLastUpdate('刚刚');
-        addOperation('RESTART', 'wal replay', lost ? 'error' : 'system', lost ? '校验失败' : '重启后仍然对', '2.4s');
+        addOperation('RESTART', 'local replay demo', lost ? 'error' : 'system', lost ? '模拟校验失败' : '模拟校验通过', '约 2.4s');
       }
     }, 90);
   };
@@ -1113,7 +1086,7 @@ export default function Home() {
         setCompactResult(before);
         setWalRecords(before.afterRecords);
         setWalBytes(before.afterBytes);
-        addOperation('COMPACT', 'rustkv.wal', 'system', '一致性通过', '1.8s');
+        addOperation('COMPACT', 'local demo', 'system', '模拟流程完成', '约 1.8s');
       }
     }, 70);
   };
@@ -1132,12 +1105,11 @@ export default function Home() {
         setBenchmarkResults((previous) => [...previous, point]);
         index += 1;
         setBenchmarkProgress(index / allData.length * 100);
-        setTotalRequests((count) => count + 10_000);
       }
       if (index >= allData.length) {
         clearTimer(benchmarkTimerRef);
         setBenchmarkStatus('COMPLETED');
-        addOperation('BENCH', `${allData.length} scales`, 'system', '测试完成', `${(allData.length * 0.9).toFixed(1)}s`);
+        addOperation('BENCH', `${allData.length} scales`, 'system', '本地模拟完成', `约 ${(allData.length * 0.9).toFixed(1)}s`);
       }
     }, 850);
   };
@@ -1157,20 +1129,20 @@ export default function Home() {
       setSubscribers((previous) => previous.map((subscriber) => subscriber.active ? { ...subscriber, received: [pubsubMessage, ...subscriber.received].slice(0, 3) } : subscriber));
       setPubsubLogs((previous) => [...previous, `[ROUTE] Broker 匹配到 ${delivered} 个订阅者`, `[DELIVER] 消息已成功投递 ${delivered} 次`]);
       setPublishing(false);
-      setTotalRequests((count) => count + 1);
-      addOperation('PUBLISH', `#${pubsubChannel}`, 'system', `${delivered} 次投递`, '1.2ms');
+      addOperation('PUBLISH', `#${pubsubChannel}`, 'system', `本地模拟 ${delivered} 次投递`, '—');
       publishTimerRef.current = null;
     }, 720);
   };
 
   const addSubscriber = () => {
-    if (subscribers.length >= 4) return;
+    if (serverState !== 'ONLINE' || publishing || subscribers.length >= 4) return;
     const id = Math.max(0, ...subscribers.map((subscriber) => subscriber.id)) + 1;
     setSubscribers((previous) => [...previous, { id, name: `Subscriber ${String.fromCharCode(64 + id)}`, active: true, received: [] }]);
     setPubsubLogs((previous) => [...previous, `[SUB] Subscriber ${String.fromCharCode(64 + id)} → #${pubsubChannel}`]);
   };
 
   const toggleSubscriber = (id: number) => {
+    if (serverState !== 'ONLINE' || publishing) return;
     setSubscribers((previous) => previous.map((subscriber) => subscriber.id === id ? { ...subscriber, active: !subscriber.active } : subscriber));
     const target = subscribers.find((subscriber) => subscriber.id === id);
     if (target) setPubsubLogs((previous) => [...previous, `[${target.active ? 'UNSUB' : 'SUB'}] ${target.name} ${target.active ? '离开' : '加入'} #${pubsubChannel}`]);
@@ -1183,13 +1155,12 @@ export default function Home() {
     clearTimer(benchmarkTimerRef);
     if (publishTimerRef.current !== null) window.clearTimeout(publishTimerRef.current);
     setActiveTab('overview');
+    setDemoMode(false);
     setServerState('ONLINE');
     setLastUpdate('刚刚');
     setEntries(makeInitialEntries());
     setWalRecords(INITIAL_WAL_RECORDS);
     setWalBytes(INITIAL_WAL_BYTES);
-    setTotalRequests(1_281_440);
-    setFailedRequests(246);
     setOperations(initialOperations);
     setConcurrencyClients(100);
     setRequestsPerClient(100);
@@ -1216,37 +1187,31 @@ export default function Home() {
     setCompactResult(null);
     setBenchmarkScales([1, 10, 50, 100]);
     setBenchmarkWorkload('混合读写');
-    setBenchmarkStatus('COMPLETED');
-    setBenchmarkProgress(100);
-    setBenchmarkResults(baselineBenchmark);
+    setBenchmarkStatus('IDLE');
+    setBenchmarkProgress(0);
+    setBenchmarkResults([]);
     setSubscribers([{ id: 1, name: 'Subscriber A', active: true, received: [] }, { id: 2, name: 'Subscriber B', active: true, received: [] }, { id: 3, name: 'Subscriber C', active: false, received: [] }]);
     setPubsubChannel('news');
     setPubsubMessage('Hello Rust');
     setPublishing(false);
     setPubsubLogs(['[READY] 发布订阅原型已就绪', '[SUB] Subscriber A → #news', '[SUB] Subscriber B → #news']);
     recoverySnapshotRef.current = [];
+    publishTimerRef.current = null;
+    logIdRef.current = 0;
     setResetOpen(false);
   };
 
   const displayedKeyCount = serverState === 'RECOVERING' ? recoveredCount : entries.length;
-  const displayedClients = concurrencyStatus === 'RUNNING' ? concurrencyClients : serverState === 'OFFLINE' ? 0 : 3;
-  const liveQps = serverState !== 'ONLINE' ? 0 : concurrencyStatus === 'RUNNING' ? concurrencyThroughput : benchmarkStatus === 'RUNNING' ? 8_640 : 1_204;
-  const successRate = ((totalRequests - failedRequests) / totalRequests * 100).toFixed(2);
   const metricStrip: LabMetricItem[] = [
-    { label: '键总数', value: formatNumber(displayedKeyCount), accent: 'cyan' },
-    { label: '活跃客户端', value: formatNumber(displayedClients), accent: 'violet' },
-    { label: '实时吞吐', value: formatNumber(liveQps), suffix: '请求/秒', accent: 'green' },
-    { label: '累计请求', value: totalRequests >= 1_000_000 ? `${(totalRequests / 1_000_000).toFixed(2)}M` : formatNumber(totalRequests), accent: 'blue' },
-    { label: '成功率', value: `${successRate}%`, accent: 'green' },
-    { label: 'WAL 大小', value: formatBytes(walBytes), accent: 'orange' },
+    { label: '本地键总数', value: formatNumber(displayedKeyCount), suffix: '仅浏览器内存', accent: 'cyan' },
   ];
   const activeNavigation = navigation.find((item) => item.id === activeTab)!;
 
   return (
     <main className={`lab-shell ${demoMode ? 'demo-mode' : ''} server-${serverState.toLowerCase()}`}>
       <header className="topbar">
-        <div className="brand-block"><div className="brand-mark"><Database size={20} /></div><div><strong>RustKV <span>实验室</span></strong><small>Rust 网络 KV 存储 · 可视化实验与测试平台</small></div></div>
-        <div className={`connection-pill state-${serverState.toLowerCase()}`}><LabStatusOrb offline={serverState !== 'ONLINE'} /><b>{serverLabels[serverState].label}</b><code>127.0.0.1:7878</code></div>
+        <div className="brand-block"><div className="brand-mark"><Database size={20} /></div><div><strong>RustKV <span>实验室</span></strong><small>纯前端交互演示 · 本次不连接后端</small></div></div>
+        <div className={`connection-pill state-${serverState.toLowerCase()}`}><LabStatusOrb offline={serverState !== 'ONLINE'} /><b>{serverLabels[serverState].label}</b><code>LOCAL DEMO · 未联调</code></div>
         <div className="top-actions">
         <LabButton variant="ghost" className="shell-button" onClick={() => setDemoMode((value) => !value)} aria-pressed={demoMode}><Presentation /> {demoMode ? '退出答辩模式' : '答辩模式'}</LabButton>
         <LabButton variant="outline" className="shell-button" onClick={() => setResetOpen(true)}><RotateCcw /> 重置实验室</LabButton>
@@ -1261,13 +1226,13 @@ export default function Home() {
         })}
       </nav>
 
-      <LabMetricStrip metrics={metricStrip} />
+      <LabMetricStrip metrics={metricStrip} aria-label="本地数据概览" />
 
       <div className="content-area">
-        <div className="page-title-row"><div><p><Activity size={14} /> RUSTKV SYSTEMS LAB / {activeNavigation.hint.toUpperCase()}</p><h1>{activeNavigation.label}</h1></div><div className={`last-update ${serverState !== 'ONLINE' ? 'frozen' : ''}`}><LabStatusOrb offline={serverState !== 'ONLINE'} /> {serverState === 'ONLINE' ? '实时更新 · 刚刚' : `${serverLabels[serverState].label} · 最后更新 ${lastUpdate}`}</div></div>
+        <div className="page-title-row"><div><p><Activity size={14} /> RUSTKV SYSTEMS LAB / {activeNavigation.hint.toUpperCase()}</p><h1>{activeNavigation.label}</h1></div><div className={`last-update ${serverState !== 'ONLINE' ? 'frozen' : ''}`}><LabStatusOrb offline={serverState !== 'ONLINE'} /> {serverState === 'ONLINE' ? '本地状态 · 刚刚' : `${serverLabels[serverState].label} · 最后更新 ${lastUpdate}`}</div></div>
 
-        {activeTab === 'overview' && <Overview serverState={serverState} qps={liveQps} walRecords={walRecords} walBytes={walBytes} operations={operations} lastUpdate={lastUpdate} concurrencyStatus={concurrencyStatus} concurrencyThroughput={concurrencyThroughput} recoveryPhase={recoveryPhase} recoveryLost={recoveryLost} benchmarkData={benchmarkResults} />}
-        {activeTab === 'kv' && <KvOperations online={serverState === 'ONLINE'} entries={entries} now={now} operations={operations} onAction={performKvAction} />}
+        {activeTab === 'overview' && <Overview serverState={serverState} operations={operations} lastUpdate={lastUpdate} concurrencyStatus={concurrencyStatus} concurrencyThroughput={concurrencyThroughput} recoveryPhase={recoveryPhase} recoveryLost={recoveryLost} benchmarkData={benchmarkResults} />}
+        {activeTab === 'kv' && <KvOperations online={serverState === 'ONLINE'} entries={entries} operations={operations} onAction={performKvAction} />}
         {activeTab === 'concurrency' && <ConcurrencyPage online={serverState === 'ONLINE'} clients={concurrencyClients} setClients={setConcurrencyClients} requestsPerClient={requestsPerClient} setRequestsPerClient={setRequestsPerClient} workload={concurrencyWorkload} setWorkload={setConcurrencyWorkload} status={concurrencyStatus} progress={concurrencyProgress} successful={concurrencySuccessful} failed={concurrencyFailed} throughput={concurrencyThroughput} elapsed={concurrencyElapsed} onStart={startConcurrency} onStop={stopConcurrency} />}
         {activeTab === 'recovery' && <RecoveryPage serverState={serverState} phase={recoveryPhase} seedCount={recoverySeedCount} setSeedCount={setRecoverySeedCount} injectFailure={injectRecoveryFailure} setInjectFailure={setInjectRecoveryFailure} beforeCount={recoveryBeforeCount} recoveredCount={recoveredCount} recoveryLost={recoveryLost} progress={recoveryProgress} logs={recoveryLogs} beforeFingerprint={beforeFingerprint} afterFingerprint={afterFingerprint} sampleBefore={recoverySamples} currentEntries={entries} onSeed={seedRecoveryData} onKill={killServer} onRestart={restartServer} compactRunning={compactRunning} compactProgress={compactProgress} compactResult={compactResult} onCompact={runCompact} />}
         {activeTab === 'performance' && <PerformancePage online={serverState === 'ONLINE'} scales={benchmarkScales} setScales={setBenchmarkScales} workload={benchmarkWorkload} setWorkload={setBenchmarkWorkload} status={benchmarkStatus} progress={benchmarkProgress} results={benchmarkResults} onStart={startBenchmark} onStop={stopBenchmark} />}
@@ -1276,7 +1241,7 @@ export default function Home() {
 
       <AlertDialog open={resetOpen} onOpenChange={setResetOpen}>
         <AlertDialogContent className="reset-dialog">
-          <AlertDialogHeader><AlertDialogTitle>重置整个演示环境？</AlertDialogTitle><AlertDialogDescription>这会清空当前实验进度、恢复初始键值、重新将服务设为在线，并还原基准测试与订阅者。</AlertDialogDescription></AlertDialogHeader>
+          <AlertDialogHeader><AlertDialogTitle>重置整个前端演示环境？</AlertDialogTitle><AlertDialogDescription>这只会清空浏览器中的实验进度，恢复初始键值与模拟在线状态；不会请求后端，也不会修改任何 WAL 文件。</AlertDialogDescription></AlertDialogHeader>
           <AlertDialogFooter><AlertDialogCancel>取消</AlertDialogCancel><AlertDialogAction onClick={resetLab}><RotateCcw /> 确认重置</AlertDialogAction></AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

@@ -1,6 +1,6 @@
 # RustKV Lab 前端设计规范
 
-> 现状基线：2026-09-01。本文档根据 `prototype/app/page.tsx`、`prototype/app/globals.css`、`prototype/app/layout.tsx`、`prototype/components/ui/*`、`prototype/components/design_lab/*` 与 `prototype/components.json` 的当前实现整理。它描述的是 RustKV Lab 现有原型的真实设计系统，不把尚未实现的页面或后端能力当作既定规范。
+> 现状基线：2026-09-02。本文档根据 `prototype/app/page.tsx`、`prototype/app/globals.css`、`prototype/app/layout.tsx`、`prototype/components/ui/*`、`prototype/components/design_lab/*` 与 `prototype/components.json` 的当前实现整理。当前交付是纯前端本地演示，不进行前后端联调；任何实验数值、服务状态、WAL 流程和发布订阅均不得被表述为真实后端结果。
 
 ## 1. 范围与设计定位
 
@@ -11,7 +11,7 @@ RustKV Lab 是 Rust 网络 KV 存储的可视化实验与测试平台。当前�
 1. **先让系统状态可读，再装饰。** 在线/离线、实验进度、WAL、吞吐、延迟和校验结论必须有清晰的文字、数值和状态样式；颜色和动效只做辅助。
 2. **实验过程可复验。** 控件、步骤、日志、数据前后对比和结论放在同一工作区内，用户应能看见“准备 → 执行 → 结果/校验”的因果链。
 3. **技术控制台的紧凑密度。** 使用深色表面、细边框、等宽数字和小型辅助标签，优先展示数据与日志，不使用消费产品式的大面积留白或插画。
-4. **中文优先，协议名保留。** 说明、按钮、状态和错误提示用中文；`SET`、`GET`、`DELETE`、`KEYS`、`WAL`、`TTL`、`BTreeMap` 等协议/实现名保留原文，并在必要处配中文解释。
+4. **中文优先，协议名保留。** 说明、按钮、状态和错误提示用中文；`SET`、`GET`、`DELETE`、`KEYS`、`WAL`、`BTreeMap` 等协议/实现名保留原文，并在必要处配中文解释。
 5. **状态必须有语义，不靠颜色猜。** 成功、异常、运行中、离线等状态同时使用文字、图标或结构变化表达。
 6. **复用现有基础设施。** 组件基于 `components/ui` 的 shadcn `base-nova` 风格、CSS 变量和 Lucide 图标；新增模式优先组合已有组件，不复制一份近似实现。
 
@@ -56,9 +56,9 @@ RustKV Lab 是 Rust 网络 KV 存储的可视化实验与测试平台。当前�
 | 读取/数据青 | `#36cfe2`、`#28cbe1`、`#35cadf` | GET、读取操作标签、键卡片图标、客户端读取 |
 | 发布订阅/系统紫 | `#a78bfa`、`#9a84ff`、`#a89af1`、`#b1a0f2` | Pub/Sub broker、系统操作、订阅者状态、系统指标 |
 | 品牌/WAL 橙 | `#f88c3f`、`#ef9555`、`#f08f4f` | RustKV 品牌标记、WAL 状态、TCP JSON 提示 |
-| 警示/进行中琥珀 | `#f3a052`、`#f1a15d`、`#f0a158` | 运行中徽章、TTL 进度、启动/恢复状态 |
+| 警示/进行中琥珀 | `#f3a052`、`#f1a15d`、`#f0a158` | 运行中徽章、启动/恢复状态 |
 | 错误/离线红 | `#f36565`、`#f26767`、`#f07171`、`#f27979` | 服务离线、失败结论、删除与错误日志 |
-| 累计请求蓝 | `#5b9cf5` | 顶部“累计请求”指标条 |
+| 保留蓝 | `#5b9cf5` | 组件库保留的次级数据色；当前全局指标条不使用 |
 | 中性结构线 | `#202a36`、`#202b37`、`#293440` | 面板/网格/控件边框和分隔线 |
 
 专项色的透明变体必须保留低对比、低亮度的实验室气质。状态色不要同时承担不相关的含义：例如橙色用于 WAL/警示，紫色用于 Pub/Sub/系统，红色用于危险/失败。
@@ -78,7 +78,6 @@ RustKV Lab 是 Rust 网络 KV 存储的可视化实验与测试平台。当前�
 | 页面标题 `h1` | `18px`；答辩模式 `23px` |
 | 面板标题 `h2` | `14px`；compact 标题 `13px`；答辩模式 `16px` |
 | 服务状态主数值 | `25px` 等宽 |
-| 实时吞吐主数值 | `24px` 等宽 |
 | 顶部指标数值 | `17px` 等宽；答辩模式 `20px` |
 | 面板 kicker/表单标签 | 约 `8–9px`，等宽 kicker 带字距 |
 | 数据、日志、辅助说明 | 约 `7–10px`；正文说明通常 `8–11px` |
@@ -93,7 +92,7 @@ RustKV Lab 是 Rust 网络 KV 存储的可视化实验与测试平台。当前�
 - 根圆角 token：`--radius: 0.72rem`（约 `11.52px`）；派生 token 为 `--radius-sm = 0.65 × radius`、`--radius-md = 0.82 × radius`、`--radius-lg = radius`、`--radius-xl = 1.28 × radius`。
 - 常见实际圆角：面板 `10px`；内嵌卡片/键单元/控制组 `7–9px`；分隔进度条 `5–10px`；状态徽章与连接 pill `999px`；步骤圆点和 broker 使用 `50%`。
 - 页面主网格统一 `gap: 12px`。内部常见间距为 `4/5/6/7/8/9/10/11/12/13/14/15/16/17/18/19px`，按层级逐步收紧；不要凭感觉引入 24px 以上的大间隔。
-- 桌面 `.content-area` 为 `padding: 16px 24px 24px`；面板多为 `17px` 内边距，服务/WAL 卡 `19px`，图表/恢复面板 `16px`，吞吐卡 `18px 18px 12px`。移动端内容区改为 `14px 12px 24px`。
+- 桌面 `.content-area` 为 `padding: 16px 24px 24px`；面板多为 `17px` 内边距，服务卡 `19px`，图表/恢复面板 `16px`。移动端内容区改为 `14px 12px 24px`。
 - 顶栏高度 `62px`，tab 导航 `49px`，顶部指标条最小高度 `62px`，页面标题行 `45px`。
 
 ### 4.2 面板与表面
@@ -117,7 +116,7 @@ box-shadow: 0 16px 36px rgba(0,0,0,.11), inset 0 1px rgba(255,255,255,.018);
 
 `.lab-shell` 至少占满视口高度，背景声明由四层组成：顶部绿色径向光晕、低透明水平网格、低透明垂直网格和 `#080b10` 底色；两层网格共同形成 `28px × 28px` 的实验网格。
 
-桌面顶栏是三列 grid：左侧品牌，中间连接状态 pill，右侧操作。连接 pill 显示状态点、中文状态和 `127.0.0.1:7878`；右侧提供“答辩模式”和“重置实验室”。下方 tab 导航固定六等分，当前项用绿色文字、浅绿背景和底部 2px 发光线标识。指标条固定六列，指标左侧使用 4px × 22px 的彩色竖条。
+桌面顶栏是三列 grid：左侧品牌，中间本地演示状态 pill，右侧操作。连接 pill 明确显示 `LOCAL DEMO · 未联调`，避免把模拟状态误认成真实连接；右侧提供“答辩模式”和“重置实验室”。下方 tab 导航固定六等分，当前项用绿色文字、浅绿背景和底部 2px 发光线标识。指标条当前只展示“本地键总数”，`LabMetricStrip` 会通过 `data-count="1"` 自动使用居中的单项布局。
 
 内容区先显示当前路径（`RUSTKV SYSTEMS LAB / ...`）、中文页面标题及最后更新时间，再渲染当前工作区。实验页统一使用 `.lab-page { height: calc(100vh - 258px); min-height: 620px; }`；短视口在桌面端允许内容区滚动。
 
@@ -125,7 +124,7 @@ box-shadow: 0 16px 36px rgba(0,0,0,.11), inset 0 1px rgba(255,255,255,.018);
 
 | 工作区 | 当前列/行定义 | 结构重点 |
 | --- | --- | --- |
-| 系统总览 | `0.9fr 1.55fr 0.92fr`；两行 `minmax(250px,.95fr)` / `minmax(270px,1fr)` | 服务卡、吞吐卡、WAL 卡；实验卡横跨两列；操作流单独一列 |
+| 系统总览 | `minmax(280px,.82fr) minmax(0,1.45fr)`；两行 `minmax(250px,.92fr)` / `minmax(270px,1.08fr)` | 本地服务状态、实验进度；操作记录横跨第二行。没有伪造的吞吐、WAL、运行时长或版本卡片 |
 | 键值操作 | `310px minmax(430px,1fr) 300px` | 命令面板、存储视图、历史记录三列 |
 | 并发实验 | `minmax(0,1fr) 350px`；首行 `112px` | 参数横跨整行；下方为客户端活动矩阵 + 实时结果 |
 | 崩溃恢复 | `330px minmax(430px,1fr) 320px`；`50px / minmax(0,1fr) / 174px` | 步骤横跨整行；控制、核心证明、WAL 重放；底部 WAL 压缩横跨整行 |
@@ -136,7 +135,7 @@ box-shadow: 0 16px 36px rgba(0,0,0,.11), inset 0 1px rgba(255,255,255,.018);
 
 - `≤1260px`：KV 从三列收窄为 `285px minmax(390px,1fr) 260px`，键卡片改为两列并隐藏第 9 个之后的卡片；恢复/性能列宽同步收窄。
 - `≤1080px`：实验页整体改为两列、自动行；大多数面板最小高度 `420px`。KV 存储、恢复压缩、发布订阅舞台等关键面板横跨两列；参数区和 KPI 横跨整行。顶栏改为两列并隐藏连接 pill；tab 隐藏英文副标题。
-- `≤760px`：顶栏允许换行（最小高度 `62px`，左右 `14px`），隐藏品牌副标题和“答辩模式”按钮；tab 横向滚动，隐藏图标旁文字；指标条变为三列；隐藏最后更新时间；总览变为单列，服务/吞吐/WAL 卡最小高度 `260px`。
+- `≤760px`：顶栏允许换行（最小高度 `62px`，左右 `14px`），隐藏品牌副标题和“答辩模式”按钮；tab 横向滚动，隐藏图标旁文字；单项指标保持居中；隐藏最后更新时间；总览变为单列，服务卡最小高度 `260px`。
 - `≤700px`：KV、并发、恢复、性能、发布订阅全部单列；实验/基准参数单列；KPI 两列；恢复步骤横向滚动且每步至少 `118px`；消息舞台单列并隐藏连接线；投递摘要缩小间距；键卡片保持两列。
 - `≤780px` 高且宽度 `>1080px`：实验页高度改为自动、最小高度 `620px`，`.content-area` 滚动，避免内容被视口裁切。
 
@@ -182,19 +181,15 @@ box-shadow: 0 16px 36px rgba(0,0,0,.11), inset 0 1px rgba(255,255,255,.018);
 
 恢复阶段为 `IDLE → PREPARED → CRASHED → RECOVERING → VERIFIED`。步骤条用 `done`、`active`、待执行三种结构表达；校验结果为等待、通过、失败，失败明确显示“发现不一致”及丢失数量，不用绿色掩盖故障注入。
 
-KV 结果为 `success/info/error`；TTL 小于等于 10 秒的键卡片加 `.ttl-warning` 橙色边框和底部剩余比例条。发布订阅中订阅者有 `listening/disconnected`，broker 有 `online/offline`，发布中显示 `.flying-message`；离线时发布按钮和订阅状态必须同时体现不可用。
+KV 结果为 `success/info/error`；`KvEntry` 只包含 `key/value`，所有本地键显示“永久保存”，不提供 TTL。Key 必须非空、不含空白或控制字符且 UTF-8 不超过 256 字节；Value 必须非空、不含控制字符且 UTF-8 不超过 16 KiB，普通空格允许保留。发布订阅中订阅者有 `listening/disconnected`，broker 有 `online/offline`，发布中显示 `.flying-message`；离线时发布、添加和订阅切换必须同时不可用。
 
 ## 7. 图表与数据可视化
 
 ### 7.1 顶部指标与格式
 
-指标条固定六项：`键总数`（青）、`活跃客户端`（紫）、`实时吞吐`（绿，单位请求/秒）、`累计请求`（蓝）、`成功率`（绿）、`WAL 大小`（橙）。数字使用 `Intl.NumberFormat('zh-CN')`；字节按 MB/KB/B 格式化。实时数据变化应更新对应数字和状态文案，而不是只移动装饰线。
+指标条只展示 `本地键总数`（青），数据来自当前 React 状态，并带“仅浏览器内存”说明。服务端吞吐、累计请求、成功率、WAL 大小、运行时长和版本均无真实来源，因此不展示。数字使用 `Intl.NumberFormat('zh-CN')`。
 
-### 7.2 总览吞吐 Sparkline
-
-`Sparkline` 是 `viewBox="0 0 680 180"` 的内联 SVG，带四条水平虚线网格（`#202b36`，`3 5`）、绿色渐变面积填充、绿色曲线和末端点。在线时曲线使用 `#2add9d`/`#64f1bd` 与轻微 `green-glow`；离线通过 `.is-frozen` 切换为 `#647184`/`#657287`，去除辉光并保持最后状态，标题显示“服务离线，曲线已冻结”。SVG 当前有 `aria-label="最近 60 秒吞吐量曲线"`。
-
-### 7.3 性能图表
+### 7.2 性能图表
 
 性能页使用 `ChartContainer` + Recharts，并通过 `ChartConfig` 暴露准确系列 token：
 
@@ -207,7 +202,7 @@ KV 结果为 `success/info/error`；TTL 小于等于 10 秒的键卡片加 `.ttl
 
 吞吐图是客户端数量对每秒请求数的 BarChart：顶部圆角 `5px`，隐藏坐标轴线和 tickLine，网格水平虚线 `#202b36`，hover cursor 为低透明绿色。延迟图是 P50/P95/P99 的 monotone LineChart：线宽 `2px`、点半径 `3px`，`x=50` 有绿色虚线参考线表示并发甜点候选。图表卡必须保留标题、单位和 tooltip；没有数据时使用空状态（“正在生成吞吐量数据点”“等待延迟样本”）而不是空白区域。
 
-### 7.4 其他数据图形
+### 7.3 其他数据图形
 
 - 并发结果环使用 `conic-gradient(#2add9d var(--progress), #1d2833 0)`，内圈 `#0f151d`，中间同时展示百分比和“已完成 / 总数”。
 - 并发/恢复/压缩 Progress indicator 使用 `linear-gradient(90deg,#22c892,#50e3b1)`；轨道 `#202b36`。
@@ -272,7 +267,7 @@ KV 结果为 `success/info/error`；TTL 小于等于 10 秒的键卡片加 `.ttl
 - `components/ui` 的 Button、Input、Progress、Switch、AlertDialog、ChartContainer 和 Lucide 图标。
 - 绿色/青色/紫色/橙色/红色的既有语义映射，并同时提供中文文字、数值或图标。
 - 1px 边框、10px 面板圆角、12px 主网格间距、深色内嵌表面和克制的同色辉光。
-- 中文优先的反馈句式、`SET/GET/DELETE/KEYS/WAL/TTL` 等保留术语、zh-CN 数字格式。
+- 中文优先的反馈句式、`SET/GET/DELETE/KEYS/WAL` 等保留术语、zh-CN 数字格式。
 - 先处理 `ONLINE/OFFLINE/RUNNING/RECOVERING` 等状态，再决定按钮是否可用、图表是否冻结和文案如何更新。
 
 ### 不应该使用
@@ -299,7 +294,7 @@ KV 结果为 `success/info/error`；TTL 小于等于 10 秒的键卡片加 `.ttl
 - `LabPanel` / `LabPanelHeader`：复用 `.panel`、`.panel-heading`、`.panel-kicker`；
 - `LabButton`：以 `success/info/danger/secondary` 映射现有 `op-button set/get/delete/keys` 与 Base UI Button variant；
 - `LabField`：统一表单 label 与字段布局；
-- `LabMetric` / `LabMetricStrip`：统一顶部指标与 `cyan/violet/green/blue/orange` accent class；
+- `LabMetric` / `LabMetricStrip`：统一顶部指标与 `cyan/violet/green/blue/orange` accent class；组件会写入 `data-count`，单项指标自动采用居中窄栏布局；
 - `LabProgress`：对现有 Progress 的轻量封装；
 - `LabStatusOrb` / `LabStatusPill` / `LabBadge`：统一在线、离线、警告、实验和校验状态；
 - `LAB_ACCENT_CLASSES`、`LAB_STATUS_PILL_CLASSES`、`LAB_BADGE_VARIANT_CLASSES`：把语义映射到既有 CSS class，而不是新增颜色值。

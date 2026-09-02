@@ -13,6 +13,7 @@ export function useIsMobile() {
       setIsMobile(window.innerWidth < MOBILE_BREAKPOINT);
     };
     mql.addEventListener('change', onChange);
+    // oxlint-disable-next-line react/react-compiler
     setIsMobile(window.innerWidth < MOBILE_BREAKPOINT);
     return () => mql.removeEventListener('change', onChange);
   }, []);

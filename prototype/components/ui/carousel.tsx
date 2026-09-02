@@ -1,5 +1,7 @@
 'use client';
 
+/* oxlint-disable jsx-a11y/prefer-tag-over-role */
+
 import * as React from 'react';
 import useEmblaCarousel, {
   type UseEmblaCarouselType,
@@ -95,6 +97,7 @@ function Carousel({
 
   React.useEffect(() => {
     if (!api) return;
+    // oxlint-disable-next-line react/react-compiler
     onSelect(api);
     api.on('reInit', onSelect);
     api.on('select', onSelect);

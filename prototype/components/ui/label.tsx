@@ -1,5 +1,7 @@
 'use client';
 
+/* oxlint-disable jsx-a11y/label-has-associated-control */
+
 import * as React from 'react';
 
 import { cn } from '@/lib/utils';

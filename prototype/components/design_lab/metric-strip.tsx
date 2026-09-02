@@ -41,7 +41,11 @@ type LabMetricStripProps = React.ComponentProps<'div'> & {
 
 function LabMetricStrip({ metrics, className, ...props }: LabMetricStripProps) {
   return (
-    <div className={cn('metric-strip', className)} {...props}>
+    <div
+      className={cn('metric-strip', className)}
+      data-count={metrics.length}
+      {...props}
+    >
       {metrics.map((metric, index) => (
         <LabMetric key={metric.id ?? index} {...metric} />
       ))}
