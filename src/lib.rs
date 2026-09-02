@@ -4,6 +4,7 @@ pub mod client;
 pub mod error;
 #[path = "persistence_advanced.rs"]
 pub mod persistence;
+pub mod persistence_basic;
 pub mod protocol;
 pub mod server;
 pub mod storage;

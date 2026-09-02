@@ -1,6 +1,9 @@
 use std::{ffi::OsString, fs, path::Path};
 
-use rust_kv_store::{error::AppError, persistence::PersistentStore, storage::SetOutcome};
+use rust_kv_store::{
+    error::AppError, persistence::PersistentStore,
+    persistence_basic::PersistentStore as BasicPersistentStore, storage::SetOutcome,
+};
 use tempfile::tempdir;
 
 fn legacy_line(record: &str) -> Vec<u8> {
@@ -36,6 +39,22 @@ fn assert_wal_reason(error: AppError, expected_line: usize, text: &str) {
         }
         other => panic!("期望WAL损坏错误，实际为：{other}"),
     }
+}
+
+#[test]
+fn basic_store_remains_available_for_control_experiments() {
+    let temp = tempdir().unwrap();
+    let wal_path = temp.path().join("basic.wal");
+
+    {
+        let mut store = BasicPersistentStore::open(&wal_path).unwrap();
+        store.set("course".into(), "Rust".into()).unwrap();
+        assert_eq!(store.get("course").unwrap(), "Rust");
+    }
+
+    let store = BasicPersistentStore::open(&wal_path).unwrap();
+    assert_eq!(store.get("course").unwrap(), "Rust");
+    assert_eq!(store.stats().wal_records, 1);
 }
 
 #[test]
