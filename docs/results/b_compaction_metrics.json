@@ -1,0 +1,116 @@
+{
+    "generated_at":  "2026-09-02T09:34:02.8106374+08:00",
+    "input":  {
+                  "operations":  2000,
+                  "live_keys":  100,
+                  "outer_runs":  5,
+                  "recovery_repeats_per_run":  7,
+                  "profile":  "release",
+                  "toolchain":  "stable-x86_64-pc-windows-gnu"
+              },
+    "versions":  {
+                     "basic_commit":  "4624d3c",
+                     "advanced_commit":  "1da03a3",
+                     "rustc":  "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+                 },
+    "medians":  {
+                    "basic_write_us":  4847883,
+                    "advanced_write_us":  4631338,
+                    "basic_disk_bytes":  170000,
+                    "advanced_disk_before_bytes":  238893,
+                    "advanced_disk_after_bytes":  4473,
+                    "compact_us":  12020,
+                    "basic_recovery_us":  1803,
+                    "advanced_recovery_before_us":  3318,
+                    "advanced_recovery_after_us":  1088
+                },
+    "derived_percent":  {
+                            "compaction_ratio":  98.127613617812159,
+                            "disk_reduction_vs_basic":  97.36882352941177,
+                            "recovery_improvement_vs_basic":  39.6561286744315,
+                            "recovery_improvement_before_after":  67.209162145871,
+                            "write_overhead":  -4.4667950938585,
+                            "wal_metadata_overhead":  40.52529411764705
+                        },
+    "samples":  {
+                    "basic":  [
+                                  {
+                                      "run":  1,
+                                      "write_us":  4936823,
+                                      "disk_bytes":  170000,
+                                      "recovery_us":  2036
+                                  },
+                                  {
+                                      "run":  2,
+                                      "write_us":  4874802,
+                                      "disk_bytes":  170000,
+                                      "recovery_us":  2031
+                                  },
+                                  {
+                                      "run":  3,
+                                      "write_us":  4614621,
+                                      "disk_bytes":  170000,
+                                      "recovery_us":  1713
+                                  },
+                                  {
+                                      "run":  4,
+                                      "write_us":  4847883,
+                                      "disk_bytes":  170000,
+                                      "recovery_us":  1622
+                                  },
+                                  {
+                                      "run":  5,
+                                      "write_us":  4656242,
+                                      "disk_bytes":  170000,
+                                      "recovery_us":  1803
+                                  }
+                              ],
+                    "advanced":  [
+                                     {
+                                         "run":  1,
+                                         "write_us":  4560066,
+                                         "disk_before_bytes":  238893,
+                                         "disk_after_bytes":  4473,
+                                         "compact_us":  38329,
+                                         "recovery_before_us":  3484,
+                                         "recovery_after_us":  1153
+                                     },
+                                     {
+                                         "run":  2,
+                                         "write_us":  4631338,
+                                         "disk_before_bytes":  238893,
+                                         "disk_after_bytes":  4473,
+                                         "compact_us":  8940,
+                                         "recovery_before_us":  3318,
+                                         "recovery_after_us":  1047
+                                     },
+                                     {
+                                         "run":  3,
+                                         "write_us":  4648167,
+                                         "disk_before_bytes":  238893,
+                                         "disk_after_bytes":  4473,
+                                         "compact_us":  12248,
+                                         "recovery_before_us":  4382,
+                                         "recovery_after_us":  1116
+                                     },
+                                     {
+                                         "run":  4,
+                                         "write_us":  4668790,
+                                         "disk_before_bytes":  238893,
+                                         "disk_after_bytes":  4473,
+                                         "compact_us":  11596,
+                                         "recovery_before_us":  3253,
+                                         "recovery_after_us":  1088
+                                     },
+                                     {
+                                         "run":  5,
+                                         "write_us":  4534779,
+                                         "disk_before_bytes":  238893,
+                                         "disk_after_bytes":  4473,
+                                         "compact_us":  12020,
+                                         "recovery_before_us":  3195,
+                                         "recovery_after_us":  1074
+                                     }
+                                 ]
+                }
+}
