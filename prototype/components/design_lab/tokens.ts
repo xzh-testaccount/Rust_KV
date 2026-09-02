@@ -23,3 +23,9 @@ export const LAB_BADGE_VARIANT_CLASSES = {
 } as const;
 
 export type LabBadgeVariant = keyof typeof LAB_BADGE_VARIANT_CLASSES;
+
+export const LAB_BENCHMARK_SERIES_COLORS = [
+  'var(--benchmark-series-a)',
+  'var(--benchmark-series-b)',
+  'var(--benchmark-series-c)',
+] as const;
