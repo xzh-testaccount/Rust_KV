@@ -66,9 +66,13 @@ fn main() {
         store.set(key, value).unwrap();
     }
     verify_final_state(&store, operations, live_keys);
-    let write_ms = write_started.elapsed().as_millis();
+    let write_us = write_started.elapsed().as_micros();
 
     let wal_bytes_before = fs::metadata(&wal_path).unwrap().len();
+    drop(store);
+    let recovery_before_compact_median_us = median_recovery_us(&wal_path, operations, live_keys);
+
+    let mut store = PersistentStore::open(&wal_path).unwrap();
     let compact_started = Instant::now();
     let compact = store.compact().unwrap();
     let compact_us = compact_started.elapsed().as_micros();
@@ -77,7 +81,7 @@ fn main() {
 
     let wal_bytes_after = fs::metadata(&wal_path).unwrap().len();
     let disk_bytes_after = snapshot_bytes + wal_bytes_after;
-    let recovery_median_us = median_recovery_us(&wal_path, operations, live_keys);
+    let recovery_after_compact_median_us = median_recovery_us(&wal_path, operations, live_keys);
 
     println!("variant=snapshot-compaction");
     println!("operations={operations}");
@@ -86,7 +90,8 @@ fn main() {
     println!("wal_bytes_after={wal_bytes_after}");
     println!("snapshot_bytes={snapshot_bytes}");
     println!("disk_bytes_after={disk_bytes_after}");
-    println!("write_ms={write_ms}");
+    println!("write_us={write_us}");
     println!("compact_us={compact_us}");
-    println!("recovery_median_us={recovery_median_us}");
+    println!("recovery_before_compact_median_us={recovery_before_compact_median_us}");
+    println!("recovery_after_compact_median_us={recovery_after_compact_median_us}");
 }
