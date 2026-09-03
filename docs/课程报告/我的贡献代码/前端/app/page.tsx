@@ -6,7 +6,6 @@ import {
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
   type CSSProperties,
 } from 'react';
 import {
@@ -41,8 +40,6 @@ import {
   ShieldCheck,
   Sparkles,
   Square,
-  Sun,
-  Moon,
   TerminalSquare,
   Trash2,
   Users,
@@ -117,34 +114,6 @@ type TabId =
   | 'concurrency'
   | 'recovery'
   | 'performance';
-
-type ThemeName = 'light' | 'dark';
-
-/* 主题外部存储：真实状态是 <html> 上的 .dark class 与 localStorage，
-   首屏内联脚本（layout.tsx）负责恢复，这里只负责读取与切换。 */
-const themeListeners = new Set<() => void>();
-
-const getTheme = (): ThemeName =>
-  typeof document !== 'undefined' && document.documentElement.classList.contains('dark') ? 'dark' : 'light';
-
-const getServerTheme = (): ThemeName => 'light';
-
-const applyTheme = (next: ThemeName) => {
-  document.documentElement.classList.toggle('dark', next === 'dark');
-  try {
-    localStorage.setItem('rustkv-theme', next);
-  } catch {
-    /* 隐私模式下 localStorage 可能不可用，忽略 */
-  }
-  themeListeners.forEach((listener) => listener());
-};
-
-const subscribeTheme = (listener: () => void) => {
-  themeListeners.add(listener);
-  return () => {
-    themeListeners.delete(listener);
-  };
-};
 
 type ServerState = 'ONLINE' | 'OFFLINE' | 'STARTING' | 'RECOVERING' | 'ERROR';
 type OperationTone = 'read' | 'write' | 'delete' | 'system' | 'error';
@@ -1232,7 +1201,7 @@ function PerformancePage({
         {allPoints.length ? (
           <ChartContainer config={throughputConfig} className="benchmark-chart" initialDimension={{ width: 640, height: 300 }} aria-label="客户端数量与吞吐量对照图">
             <LineChart data={chartData} margin={{ top: 28, right: 22, bottom: 4, left: 2 }}>
-              <CartesianGrid vertical={false} strokeDasharray="3 5" className="cartesian-grid" />
+              <CartesianGrid vertical={false} stroke="#202b36" strokeDasharray="3 5" />
               <XAxis dataKey="clients" tickLine={false} axisLine={false} tickFormatter={(value) => `${value}C`} />
               <YAxis tickLine={false} axisLine={false} width={42} />
               <ChartTooltip content={<ChartTooltipContent indicator="line" />} />
@@ -1252,7 +1221,7 @@ function PerformancePage({
         {allPoints.length ? (
           <ChartContainer config={latencyConfig} className="benchmark-chart" initialDimension={{ width: 640, height: 300 }} aria-label="客户端数量与延迟分位对照图">
             <LineChart data={chartData} margin={{ top: 28, right: 22, bottom: 4, left: 2 }}>
-              <CartesianGrid vertical={false} strokeDasharray="3 5" className="cartesian-grid" />
+              <CartesianGrid vertical={false} stroke="#202b36" strokeDasharray="3 5" />
               <XAxis dataKey="clients" tickLine={false} axisLine={false} />
               <YAxis tickLine={false} axisLine={false} width={34} />
               <ReferenceLine x={50} stroke="var(--primary)" strokeDasharray="4 5" strokeOpacity={0.24} />
@@ -1292,7 +1261,6 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<TabId>('overview');
   const [backendMode, setBackendMode] = useState(false);
   const [backendProbeEpoch, setBackendProbeEpoch] = useState(0);
-  const theme = useSyncExternalStore(subscribeTheme, getTheme, getServerTheme);
   const [resetOpen, setResetOpen] = useState(false);
   const [serverState, setServerState] = useState<ServerState>('ONLINE');
   const [lastUpdate, setLastUpdate] = useState('刚刚');
@@ -1358,10 +1326,6 @@ export default function Home() {
   const benchmarkCurrentJobRef = useRef<BenchmarkJob | null>(null);
   const benchmarkCompletedRef = useRef(0);
   const benchmarkTotalRef = useRef(0);
-
-  const toggleTheme = useCallback(() => {
-    applyTheme(getTheme() === 'dark' ? 'light' : 'dark');
-  }, []);
 
   const clearTimer = (timerRef: { current: number | null }) => {
     if (timerRef.current !== null) window.clearInterval(timerRef.current);
@@ -2351,7 +2315,6 @@ export default function Home() {
         <div className="top-actions">
         <LabButton variant="ghost" className="shell-button" onClick={switchExecutionMode} aria-pressed={backendMode}><Presentation /> {backendMode ? '退出答辩模式' : '进入答辩模式'}</LabButton>
         <LabButton variant="outline" className="shell-button" onClick={() => setResetOpen(true)}><RotateCcw /> 重置实验室</LabButton>
-<LabButton variant="ghost" className="shell-button" onClick={toggleTheme} aria-label={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}>{theme === 'dark' ? <Sun /> : <Moon />} {theme === 'dark' ? '浅色' : '深色'}</LabButton>
         </div>
       </header>
 
