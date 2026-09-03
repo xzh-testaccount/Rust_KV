@@ -842,6 +842,40 @@ function RecoveryPage({
   );
 }
 
+function StorageHistoryPanel() {
+  return <LabPanel className="storage-history-comparison">
+    <LabPanelHeader
+      icon={<Sparkles size={15} />}
+      eyebrow="B 模块提高项 · 历史实测"
+      title="基础 WAL vs Snapshot + WAL 压缩"
+      action={<span className="experiment-source measured">2026-09-02 · 固定负载历史实测</span>}
+    />
+    <div className="storage-history-legend" aria-label="历史实测系列图例">
+      <span className="basic"><i />基础 WAL</span>
+      <span className="advanced-before"><i />创新版压缩前</span>
+      <span className="advanced-after"><i />Snapshot + 压缩后</span>
+    </div>
+    <div className="storage-history-conditions"><span>2,000 Operations</span><span>100 Live Keys</span><span>5 Runs Median</span><span>Release · Windows GNU</span></div>
+    <div className="storage-history-grid">
+      {STORAGE_HISTORY_METRICS.map((metric) => {
+        const maxValue = Math.max(...metric.bars.map((bar) => bar.value ?? 0), 1);
+        return <article key={metric.id} className="storage-history-metric">
+          <div className="storage-history-title"><strong>{metric.label}</strong><small>{metric.scale}</small></div>
+          <div className="storage-history-bars">
+            {metric.bars.map((bar) => <div key={bar.id} className="storage-history-row">
+              <span>{bar.label}</span>
+              <div className="storage-history-track"><i className={bar.id} style={{ width: bar.value === null ? 0 : `${bar.value / maxValue * 100}%` }} /></div>
+              <b>{bar.display}</b>
+            </div>)}
+          </div>
+          <p>{metric.note}</p>
+        </article>;
+      })}
+    </div>
+    <footer>每张指标卡使用自己的纵向数值范围，柱长只能在同一卡片内比较；该区域展示已保存实验记录，不会随当前服务器状态变化。</footer>
+  </LabPanel>;
+}
+
 function StorageInnovationPanels({
   backendMode,
   online,
@@ -920,40 +954,7 @@ function StorageInnovationPanels({
     }
   };
 
-  return <>
-    <LabPanel className="storage-history-comparison">
-      <LabPanelHeader
-        icon={<Sparkles size={15} />}
-        eyebrow="B 模块提高项 · 历史实测"
-        title="基础 WAL vs Snapshot + WAL 压缩"
-        action={<span className="experiment-source measured">2026-09-02 · 固定负载历史实测</span>}
-      />
-      <div className="storage-history-legend" aria-label="历史实测系列图例">
-        <span className="basic"><i />基础 WAL</span>
-        <span className="advanced-before"><i />创新版压缩前</span>
-        <span className="advanced-after"><i />Snapshot + 压缩后</span>
-      </div>
-      <div className="storage-history-conditions"><span>2,000 Operations</span><span>100 Live Keys</span><span>5 Runs Median</span><span>Release · Windows GNU</span></div>
-      <div className="storage-history-grid">
-        {STORAGE_HISTORY_METRICS.map((metric) => {
-          const maxValue = Math.max(...metric.bars.map((bar) => bar.value ?? 0), 1);
-          return <article key={metric.id} className="storage-history-metric">
-            <div className="storage-history-title"><strong>{metric.label}</strong><small>{metric.scale}</small></div>
-            <div className="storage-history-bars">
-              {metric.bars.map((bar) => <div key={bar.id} className="storage-history-row">
-                <span>{bar.label}</span>
-                <div className="storage-history-track"><i className={bar.id} style={{ width: bar.value === null ? 0 : `${bar.value / maxValue * 100}%` }} /></div>
-                <b>{bar.display}</b>
-              </div>)}
-            </div>
-            <p>{metric.note}</p>
-          </article>;
-        })}
-      </div>
-      <footer>每张指标卡使用自己的纵向数值范围，柱长只能在同一卡片内比较；该区域展示已保存实验记录，不会随当前服务器状态变化。</footer>
-    </LabPanel>
-
-    <LabPanel className="storage-live-state" aria-live="polite">
+  return <LabPanel className="storage-live-state" aria-live="polite">
       <LabPanelHeader
         icon={<HardDrive size={15} />}
         eyebrow="Current Storage · 实时后端"
@@ -991,8 +992,7 @@ function StorageInnovationPanels({
         <LabButton onClick={() => void compactStorage()} disabled={!backendMode || !online || loading || compacting || !visibleStorageState?.writable}>{compacting ? <Activity /> : <HardDrive />}{compacting ? '正在 Compact…' : '执行真实 Compact'}</LabButton>
       </div>
       <p className="compact-warning">Compact 会把当前最终状态原子发布为 Snapshot，再清理已覆盖的 WAL；操作期间写入会短暂停顿。</p>
-    </LabPanel>
-  </>;
+    </LabPanel>;
 }
 
 function PerformancePage({
@@ -1147,6 +1147,8 @@ function PerformancePage({
 
   return (
     <section className="performance-page lab-page">
+      <StorageHistoryPanel />
+      <StorageInnovationPanels backendMode={backendMode} online={online} />
       <LabPanel className="benchmark-config">
         <div className="benchmark-config-heading">
           <div><span className="panel-kicker"><Gauge size={15} /> 可控变量性能实验室</span><h2>固定条件 → 改变一个变量 → 自动运行 → 比较结果</h2></div>
@@ -1182,8 +1184,6 @@ function PerformancePage({
         <LabPanelHeader icon={<ListChecks size={15} />} eyebrow="Fixed Conditions" title="所有对照组共享同一实验条件" action={<span className="prototype-label">WAL / sync_data 不可切换</span>} />
         <div><span>Dataset Size</span><strong>10,000 Keys</strong></div><div><span>Value Size</span><strong>128 B</strong></div><div><span>Requests / Scale</span><strong>10,000</strong></div><div><span>Persistence</span><strong>WAL + sync_data</strong></div><div><span>Protocol</span><strong>JSON Lines</strong></div><div><span>Network</span><strong>Localhost</strong></div>
       </LabPanel>
-
-      <StorageInnovationPanels backendMode={backendMode} online={online} />
 
       <LabPanel className="scale-runner" aria-live="polite">
         <LabPanelHeader icon={<Activity size={15} />} eyebrow="执行序列" title={stage || '等待运行实验'} action={<div className="runner-progress"><span>{completedSteps} / {totalSteps || displayedSeries.length * scales.length} Steps</span><strong>{Math.round(progress)}%</strong></div>} />
