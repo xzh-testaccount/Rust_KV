@@ -127,7 +127,7 @@ const themeListeners = new Set<() => void>();
 const getTheme = (): ThemeName =>
   typeof document !== 'undefined' && document.documentElement.classList.contains('dark') ? 'dark' : 'light';
 
-const getServerTheme = (): ThemeName => 'light';
+const getServerTheme = (): ThemeName => 'dark';
 
 const applyTheme = (next: ThemeName) => {
   document.documentElement.classList.toggle('dark', next === 'dark');
@@ -176,6 +176,15 @@ type OperationLog = {
 
 type KvAction = 'SET' | 'GET' | 'DELETE' | 'KEYS';
 
+type CrudCoverage = {
+  setCreate: boolean;
+  setReplace: boolean;
+  get: boolean;
+  delete: boolean;
+  keys: boolean;
+  error: boolean;
+};
+
 type KvResult = {
   kind: 'success' | 'info' | 'error';
   title: string;
@@ -221,6 +230,14 @@ const FULL_BENCHMARK_REQUESTS = 10_000;
 const QUICK_BENCHMARK_DURATION_MS = 3_000;
 const QUICK_BENCHMARK_SCALES = [1, 128] as const;
 const FULL_BENCHMARK_SCALES = [1, 10, 50, 100] as const;
+const EMPTY_CRUD_COVERAGE: CrudCoverage = {
+  setCreate: false,
+  setReplace: false,
+  get: false,
+  delete: false,
+  keys: false,
+  error: false,
+};
 
 type StorageHistoryBar = {
   id: 'basic' | 'advanced-before' | 'advanced-after';
@@ -306,7 +323,7 @@ const serverLabels: Record<ServerState, { label: string; detail: string }> = {
   ONLINE: { label: '服务在线', detail: '网络与存储正常' },
   OFFLINE: { label: '服务离线', detail: '进程已被强制终止' },
   STARTING: { label: '正在启动', detail: '初始化存储引擎' },
-  RECOVERING: { label: '正在恢复', detail: '重放 WAL 日志' },
+  RECOVERING: { label: '正在恢复', detail: '加载 Snapshot 并重放增量 WAL' },
   ERROR: { label: '服务异常', detail: '需要人工检查' },
 };
 
@@ -470,6 +487,7 @@ function Overview({
   backendMode,
   serverState,
   operations,
+  crudCoverage,
   lastUpdate,
   concurrencyStatus,
   concurrencyFailed,
@@ -481,6 +499,7 @@ function Overview({
   backendMode: boolean;
   serverState: ServerState;
   operations: OperationLog[];
+  crudCoverage: CrudCoverage;
   lastUpdate: string;
   concurrencyStatus: ExperimentStatus;
   concurrencyFailed: number;
@@ -490,27 +509,36 @@ function Overview({
   benchmarkSeries: BenchmarkSeries[];
 }) {
   const online = serverState === 'ONLINE';
+  const pending = serverState === 'STARTING' || serverState === 'RECOVERING';
+  const unavailable = serverState === 'OFFLINE' || serverState === 'ERROR';
   const benchmarkPointCount = benchmarkSeries.reduce((count, series) => count + series.points.length, 0);
+  const crudCheckCount = Object.values(crudCoverage).filter(Boolean).length;
+  const crudCompleted = crudCheckCount === Object.keys(EMPTY_CRUD_COVERAGE).length;
   return (
     <section className="overview-grid lab-page" aria-label="系统总览">
-      <LabPanel className={`server-card ${online ? '' : 'offline-panel'}`}>
+      <LabPanel className={`server-card ${unavailable ? 'offline-panel' : ''}`}>
         <div className="panel-kicker"><Server size={15} /> 服务节点</div>
-        <div className={`server-state state-${serverState.toLowerCase()}`}><LabStatusOrb offline={!online} /> {serverLabels[serverState].label}</div>
+        <div className={`server-state state-${serverState.toLowerCase()}`}><LabStatusOrb offline={unavailable} className={pending ? 'warning' : undefined} /> {serverLabels[serverState].label}</div>
         <p className="muted">{backendMode ? '控制器 127.0.0.1:7879 → RustKV 127.0.0.1:7878' : '纯前端 UI / 动画测试 · 不连接后端'}</p>
         <div className="frontend-scope">
           <div><span>运行模式</span><strong>{backendMode ? '答辩模式 · 后端实测' : '纯前端模式 · UI 测试'}</strong></div>
           <div><span>状态来源</span><strong>{backendMode ? '接入层接口响应' : '前端本地状态机'}</strong></div>
           <div><span>网络请求</span><strong>{backendMode ? '按操作发送' : '不发送'}</strong></div>
         </div>
-        <div className={online ? 'healthy-row' : 'error-row'}>
-          {online ? <CheckCircle2 size={15} /> : <WifiOff size={15} />}
-          {online ? (backendMode ? '接入层状态正常，可开始答辩实测' : '前端交互状态正常，可测试 UI 与动画') : `${backendMode ? '后端连接' : '本地模拟'}已离线 · ${lastUpdate}`}
+        <div className={online ? 'healthy-row' : pending ? 'pending-row' : 'error-row'}>
+          {online ? <CheckCircle2 size={15} /> : pending ? <Activity size={15} /> : <WifiOff size={15} />}
+          {online
+            ? (backendMode ? '接入层状态正常，可开始答辩实测' : '前端交互状态正常，可测试 UI 与动画')
+            : pending
+              ? `${serverLabels[serverState].detail}，请稍候`
+              : `${backendMode ? '后端连接' : '本地模拟'}不可用 · ${lastUpdate}`}
         </div>
       </LabPanel>
 
       <LabPanel className="experiment-card">
         <LabPanelHeader icon={<Boxes size={15} />} eyebrow="答辩流程" title="四步实验进度" action={<span className="prototype-label">{backendMode ? '后端实测模式' : '纯前端 UI 测试'}</span>} />
         <div className="experiment-list">
+          <div><span className="experiment-icon orange"><Database size={17} /></span><p><strong>CRUD 与异常处理</strong><small>新增 / 覆盖 / 查询 / 删除 / 列表 / 错误</small></p><b>{crudCompleted ? 'PASS' : `${crudCheckCount}/6`} <small>检查项</small></b><em>{crudCompleted ? '已校验' : crudCheckCount ? '进行中' : '待运行'}</em></div>
           <div><span className="experiment-icon cyan"><Network size={17} /></span><p><strong>多客户端并发</strong><small>只验证完成数、成功数与失败数</small></p><b>{concurrencyStatus === 'COMPLETED' ? (concurrencyFailed ? 'FAIL' : 'PASS') : '—'} <small>正确性</small></b><em>{concurrencyStatus === 'RUNNING' ? '运行中' : concurrencyStatus === 'COMPLETED' ? '已校验' : concurrencyStatus === 'STOPPED' || concurrencyStatus === 'INTERRUPTED' ? '未完成' : '待运行'}</em></div>
           <div><span className="experiment-icon green"><ShieldCheck size={17} /></span><p><strong>崩溃恢复</strong><small>持久化 Snapshot + 增量 WAL</small></p><b>{recoveryPhase === 'VERIFIED' ? recoveryLost : '—'} <small>丢失键</small></b><em>{recoveryPhase === 'VERIFIED' ? (recoveryLost > 0 ? 'CONSISTENCY FAIL' : 'CONSISTENCY PASS') : '待运行'}</em></div>
           <div><span className="experiment-icon violet"><Gauge size={17} /></span><p><strong>性能实验室</strong><small>控制变量 · 自动多规模 / A/B</small></p><b>{benchmarkPointCount || '—'} <small>已收集点</small></b><em>{benchmarkStatus === 'RUNNING' ? '运行中' : benchmarkStatus === 'COMPLETED' ? '已完成' : benchmarkStatus === 'INTERRUPTED' ? '可重试' : '待运行'}</em></div>
@@ -518,7 +546,7 @@ function Overview({
       </LabPanel>
 
       <LabPanel className="ops-card">
-        <LabPanelHeader icon={<TerminalSquare size={15} />} eyebrow="本地操作" title="最近交互记录" action={<span className={online ? 'streaming' : 'streaming stopped'}><i /> {online ? '等待操作' : '已暂停'}</span>} />
+        <LabPanelHeader icon={<TerminalSquare size={15} />} eyebrow="本地操作" title="最近交互记录" action={<span className={online ? 'streaming' : pending ? 'streaming waiting' : 'streaming stopped'}><i /> {online ? '等待操作' : pending ? '等待连接' : '已暂停'}</span>} />
         <div className="ops-list">
           {operations.length ? operations.slice(0, 5).map((row) => (
             <div key={row.id}>
@@ -533,17 +561,19 @@ function Overview({
 
 function KvOperations({
   backendMode,
-  online,
+  serverState,
   entries,
   operations,
   onAction,
 }: {
   backendMode: boolean;
-  online: boolean;
+  serverState: ServerState;
   entries: KvEntry[];
   operations: OperationLog[];
   onAction: (action: KvAction, key: string, value: string) => Promise<KvResult>;
 }) {
+  const online = serverState === 'ONLINE';
+  const connectionPending = backendMode && (serverState === 'STARTING' || serverState === 'RECOVERING');
   const [key, setKey] = useState('course:name');
   const [value, setValue] = useState('Rust 网络 KV 存储');
   const [search, setSearch] = useState('');
@@ -566,11 +596,19 @@ function KvOperations({
   const pageCount = Math.max(1, Math.ceil(filteredEntries.length / pageSize));
   const safePage = Math.min(page, pageCount - 1);
   const visibleEntries = filteredEntries.slice(safePage * pageSize, (safePage + 1) * pageSize);
-  const visibleResult = online ? result : {
-    kind: 'error' as const,
-    title: backendMode ? '后端不可达' : '本地测试状态为离线',
-    message: backendMode ? '请确认本地控制器与 RustKV Server 已启动，再重新连接。' : '请先在“崩溃恢复”页面执行模拟重启。',
-  };
+  const visibleResult = online
+    ? result
+    : connectionPending
+      ? {
+          kind: 'info' as const,
+          title: serverState === 'RECOVERING' ? '正在恢复数据' : '正在连接后端',
+          message: '正在等待 RustKV Server 确认状态，请稍候。',
+        }
+      : {
+          kind: 'error' as const,
+          title: backendMode ? '后端不可达' : '本地测试状态为离线',
+          message: backendMode ? '请确认本地控制器与 RustKV Server 已启动，再重新连接。' : '请先在“崩溃恢复”页面执行模拟重启。',
+        };
 
   const execute = async (action: KvAction) => {
     setPending(true);
@@ -592,7 +630,7 @@ function KvOperations({
   return (
     <section className="kv-page lab-page">
       <LabPanel className="command-panel">
-        <LabPanelHeader icon={<KeyRound size={15} />} eyebrow="命令面板" title="键值基础操作" action={<LabStatusPill tone={online ? 'online' : 'offline'}>{online ? '可执行' : '连接已断开'}</LabStatusPill>} />
+        <LabPanelHeader icon={<KeyRound size={15} />} eyebrow="命令面板" title="键值基础操作" action={<LabStatusPill tone={online ? 'online' : connectionPending ? 'warning' : 'offline'}>{online ? '可执行' : connectionPending ? '正在连接' : '连接已断开'}</LabStatusPill>} />
         <div className="form-stack">
           <LabField label="键 Key" htmlFor="kv-key"><Input id="kv-key" value={key} disabled={!online || pending} onChange={(event) => setKey(event.target.value)} placeholder="例如 user:1001" /></LabField>
           <LabField label="值 Value" htmlFor="kv-value"><Input id="kv-value" value={value} disabled={!online || pending} onChange={(event) => setValue(event.target.value)} placeholder="请输入字符串值" /></LabField>
@@ -1222,9 +1260,9 @@ function PerformancePage({
               <ChartTooltip content={<ChartTooltipContent indicator="line" />} />
               <Legend iconType="circle" iconSize={7} />
               {series.map((item) => <Line key={item.id} type="monotone" dataKey={`${item.id}Qps`} stroke={`var(--color-${item.id}Qps)`} strokeWidth={2.4} connectNulls={false} dot={{ r: 3 }} />)}
-              {peakMarker && <ReferenceDot x={peakMarker.clients} y={peakMarker.qps} r={4} fill="var(--primary)" stroke="var(--background)" label={{ value: 'Peak', position: 'top', fill: 'var(--muted-foreground)', fontSize: 8 }} />}
-              {turningMarker && <ReferenceDot x={turningMarker.clients} y={turningMarker.qps} r={4} fill="var(--benchmark-turning)" stroke="var(--background)" label={{ value: '拐点', position: 'right', fill: 'var(--muted-foreground)', fontSize: 8 }} />}
-              {maxDifferenceMarker && <ReferenceDot x={maxDifferenceMarker.clients} y={maxDifferenceMarker.qps} r={4} fill="var(--benchmark-difference)" stroke="var(--background)" label={{ value: '最大差异', position: 'left', fill: 'var(--muted-foreground)', fontSize: 8 }} />}
+              {peakMarker && <ReferenceDot x={peakMarker.clients} y={peakMarker.qps} r={4} fill="var(--primary)" stroke="var(--background)" label={{ value: 'Peak', position: 'top', fill: 'var(--muted-foreground)', fontSize: 10 }} />}
+              {turningMarker && <ReferenceDot x={turningMarker.clients} y={turningMarker.qps} r={4} fill="var(--benchmark-turning)" stroke="var(--background)" label={{ value: '拐点', position: 'right', fill: 'var(--muted-foreground)', fontSize: 10 }} />}
+              {maxDifferenceMarker && <ReferenceDot x={maxDifferenceMarker.clients} y={maxDifferenceMarker.qps} r={4} fill="var(--benchmark-difference)" stroke="var(--background)" label={{ value: '最大差异', position: 'left', fill: 'var(--muted-foreground)', fontSize: 10 }} />}
             </LineChart>
           </ChartContainer>
         ) : <div className="empty-state chart-empty"><Gauge /><strong>等待实验数据</strong><p>每完成一个 Scale，曲线会立即增加一个数据点。</p></div>}
@@ -1274,16 +1312,17 @@ function PerformancePage({
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<TabId>('overview');
-  const [backendMode, setBackendMode] = useState(false);
+  const [backendMode, setBackendMode] = useState(true);
   const [backendProbeEpoch, setBackendProbeEpoch] = useState(0);
   const theme = useSyncExternalStore(subscribeTheme, getTheme, getServerTheme);
   const [resetOpen, setResetOpen] = useState(false);
-  const [serverState, setServerState] = useState<ServerState>('ONLINE');
+  const [serverState, setServerState] = useState<ServerState>('STARTING');
   const [lastUpdate, setLastUpdate] = useState('刚刚');
-  const [entries, setEntries] = useState<KvEntry[]>(makeInitialEntries);
+  const [entries, setEntries] = useState<KvEntry[]>([]);
   const [operations, setOperations] = useState<OperationLog[]>(initialOperations);
+  const [crudCoverage, setCrudCoverage] = useState<CrudCoverage>({ ...EMPTY_CRUD_COVERAGE });
 
-  const [concurrencyClients, setConcurrencyClients] = useState(100);
+  const [concurrencyClients, setConcurrencyClients] = useState(10);
   const [requestsPerClient, setRequestsPerClient] = useState(100);
   const [concurrencyWorkload, setConcurrencyWorkload] = useState<Workload>('MIXED');
   const [concurrencyStatus, setConcurrencyStatus] = useState<ExperimentStatus>('IDLE');
@@ -1359,6 +1398,10 @@ export default function Home() {
     const next: OperationLog = { id: logIdRef.current, time: formatClock(), op, detail, latency, tone, result };
     setOperations((previous) => [next, ...previous].slice(0, 20));
     setLastUpdate(formatClock().slice(0, 8));
+  }, []);
+
+  const markCrudCheck = useCallback((check: keyof CrudCoverage) => {
+    setCrudCoverage((previous) => previous[check] ? previous : { ...previous, [check]: true });
   }, []);
 
   const refreshBackendEntries = useCallback(async () => {
@@ -1465,6 +1508,7 @@ export default function Home() {
     if (action !== 'KEYS') {
       const keyError = validateKey(key);
       if (keyError) {
+        markCrudCheck('error');
         addOperation(action, key || '(empty)', 'error', keyError.title, '—');
         return keyError;
       }
@@ -1481,6 +1525,7 @@ export default function Home() {
         if (action === 'SET') {
           const valueError = validateValue(value);
           if (valueError) {
+            markCrudCheck('error');
             addOperation('SET', normalizedKey, 'error', valueError.title, '—');
             return valueError;
           }
@@ -1490,6 +1535,7 @@ export default function Home() {
           setEntries((previous) => previous.some((entry) => entry.key === normalizedKey)
             ? previous.map((entry) => entry.key === normalizedKey ? { key: normalizedKey, value } : entry)
             : [{ key: normalizedKey, value }, ...previous]);
+          markCrudCheck(response.replaced ? 'setReplace' : 'setCreate');
           const latency = `${(performance.now() - startedAt).toFixed(1)} ms`;
           addOperation('SET', normalizedKey, 'write', response.replaced ? '后端已更新' : '后端已创建', latency);
           return { kind: 'success', title: response.replaced ? '写入成功 · 已更新' : '写入成功 · 已创建', message: '后端成功响应表示 WAL、flush 与 sync_data 已完成。' };
@@ -1499,6 +1545,7 @@ export default function Home() {
           if (isStale()) return staleResult;
           if (response.kind !== 'get') throw new RustKvApiError('INVALID_RESPONSE', 'get 响应类型不匹配');
           setEntries((previous) => previous.some((entry) => entry.key === normalizedKey) ? previous.map((entry) => entry.key === normalizedKey ? { key: normalizedKey, value: response.value } : entry) : [{ key: normalizedKey, value: response.value }, ...previous]);
+          markCrudCheck('get');
           const latency = `${(performance.now() - startedAt).toFixed(1)} ms`;
           addOperation('GET', normalizedKey, 'read', '后端命中', latency);
           return { kind: 'success', title: '后端读取成功', message: `返回 ${response.value.length} 个字符。`, value: response.value };
@@ -1509,6 +1556,7 @@ export default function Home() {
           if (response.kind !== 'delete') throw new RustKvApiError('INVALID_RESPONSE', 'delete 响应类型不匹配');
           if (!response.deleted) throw new RustKvApiError('NOT_FOUND', `键不存在：${normalizedKey}`);
           setEntries((previous) => previous.filter((entry) => entry.key !== normalizedKey));
+          markCrudCheck('delete');
           const latency = `${(performance.now() - startedAt).toFixed(1)} ms`;
           addOperation('DEL', normalizedKey, 'delete', '后端已删除', latency);
           return { kind: 'success', title: '后端删除成功', message: '删除记录已持久化到 WAL。' };
@@ -1516,13 +1564,16 @@ export default function Home() {
         const loaded = await refreshBackendEntries();
         if (isStale()) return staleResult;
         setEntries(loaded);
+        markCrudCheck('keys');
         const latency = `${(performance.now() - startedAt).toFixed(1)} ms`;
         addOperation('KEYS', '*', 'system', `${loaded.length} 个后端键`, latency);
         return { kind: 'info', title: `共有 ${formatNumber(loaded.length)} 个后端键`, message: '已通过 KEYS + GET 刷新存储视图。' };
       } catch (error) {
         if (isStale()) return staleResult;
         const apiError = error instanceof RustKvApiError ? error : new RustKvApiError('UNKNOWN', '未知请求错误');
-        if (apiError.code === 'BACKEND_UNREACHABLE' || apiError.code === 'TIMEOUT') setServerState('OFFLINE');
+        const transportFailure = apiError.code === 'BACKEND_UNREACHABLE' || apiError.code === 'TIMEOUT';
+        if (transportFailure) setServerState('OFFLINE');
+        else markCrudCheck('error');
         if (apiError.code === 'STORAGE_ERROR') setServerState('ERROR');
         addOperation(action, normalizedKey || '*', 'error', apiError.code, `${(performance.now() - startedAt).toFixed(1)} ms`);
         return { kind: 'error', title: `${apiError.code}`, message: apiError.message };
@@ -1532,31 +1583,38 @@ export default function Home() {
     if (action === 'SET') {
       const valueError = validateValue(value);
       if (valueError) {
+        markCrudCheck('error');
         addOperation('SET', normalizedKey, 'error', valueError.title, '—');
         return valueError;
       }
       setEntries((previous) => existing ? previous.map((entry) => entry.key === normalizedKey ? { key: normalizedKey, value } : entry) : [{ key: normalizedKey, value }, ...previous]);
+      markCrudCheck(existing ? 'setReplace' : 'setCreate');
       addOperation('SET', normalizedKey, 'write', existing ? '本地已更新' : '本地已创建', '—');
       return { kind: 'success', title: existing ? '纯前端写入 · 已更新' : '纯前端写入 · 已创建', message: '仅更新浏览器内存，用于测试 CRUD 界面与动画。' };
     }
     if (action === 'GET') {
       if (!existing) {
+        markCrudCheck('error');
         addOperation('GET', normalizedKey, 'read', '本地未找到', '—');
         return { kind: 'error', title: '未找到 NOT_FOUND', message: `存储中不存在键“${normalizedKey}”。` };
       }
       addOperation('GET', normalizedKey, 'read', '本地命中', '—');
+      markCrudCheck('get');
       return { kind: 'success', title: '本地读取成功', message: `已从浏览器内存返回 ${existing.value.length} 个字符。`, value: existing.value };
     }
     if (action === 'DELETE') {
       if (!existing) {
+        markCrudCheck('error');
         addOperation('DEL', normalizedKey, 'delete', '本地未找到', '—');
         return { kind: 'error', title: '删除失败 · 未找到', message: `键“${normalizedKey}”不存在，存储未发生变化。` };
       }
       setEntries((previous) => previous.filter((entry) => entry.key !== normalizedKey));
+      markCrudCheck('delete');
       addOperation('DEL', normalizedKey, 'delete', '本地删除', '—');
       return { kind: 'success', title: '纯前端删除成功', message: '浏览器内存中的记录已删除；未请求后端或修改 WAL。' };
     }
     addOperation('KEYS', '*', 'system', `${entries.length} 个本地键`, '—');
+    markCrudCheck('keys');
     return { kind: 'info', title: `共有 ${formatNumber(entries.length)} 个本地键`, message: '右侧存储视图已分页展示，可通过搜索快速定位。' };
   };
 
@@ -2321,7 +2379,8 @@ export default function Home() {
     }
     setLastUpdate('刚刚');
     setOperations(initialOperations);
-    setConcurrencyClients(100);
+    setCrudCoverage({ ...EMPTY_CRUD_COVERAGE });
+    setConcurrencyClients(10);
     setRequestsPerClient(100);
     setConcurrencyWorkload('MIXED');
     setConcurrencyStatus('IDLE');
@@ -2386,19 +2445,28 @@ export default function Home() {
     : serverState === 'RECOVERING'
       ? recoveredCount
       : entries.length;
+  const backendCountConfirmed = serverState === 'ONLINE'
+    || recoveryPhase !== 'IDLE' && recoveryPhase !== 'ERROR';
   const metricStrip: LabMetricItem[] = [
-    { label: backendMode ? '后端键总数' : '本地键总数', value: formatNumber(displayedKeyCount), suffix: backendMode ? '来自接入层' : '纯前端内存', accent: 'cyan' },
+    {
+      label: backendMode ? '后端键总数' : '本地键总数',
+      value: backendMode && !backendCountConfirmed ? '—' : formatNumber(displayedKeyCount),
+      suffix: backendMode ? backendCountConfirmed ? '来自接入层' : '等待后端确认' : '纯前端内存',
+      accent: 'cyan',
+    },
   ];
   const activeNavigation = navigation.find((item) => item.id === activeTab)!;
+  const serverPending = serverState === 'STARTING' || serverState === 'RECOVERING';
+  const serverUnavailable = serverState === 'OFFLINE' || serverState === 'ERROR';
 
   return (
     <main className={`lab-shell ${backendMode ? 'debate-mode' : 'frontend-mode'} server-${serverState.toLowerCase()}`}>
       <header className="topbar">
         <div className="brand-block"><div className="brand-mark"><Database size={20} /></div><div><strong>RustKV <span>实验室</span></strong><small>{backendMode ? '答辩模式 · 接入后端实测' : '纯前端模式 · UI 与动画测试'}</small></div></div>
-        <div className={`connection-pill state-${serverState.toLowerCase()} ${backendMode ? 'backend' : 'frontend'}`}><LabStatusOrb offline={serverState !== 'ONLINE'} /><b>{backendMode ? serverLabels[serverState].label : serverState === 'ONLINE' ? 'UI 测试就绪' : serverLabels[serverState].label}</b><code>{backendMode ? 'BACKEND LAB · 答辩实测' : 'FRONTEND ONLY · 非实测'}</code></div>
+        <div className={`connection-pill state-${serverState.toLowerCase()} ${backendMode ? 'backend' : 'frontend'}`}><LabStatusOrb offline={serverUnavailable} className={serverPending ? 'warning' : undefined} /><b>{backendMode ? serverLabels[serverState].label : serverState === 'ONLINE' ? 'UI 测试就绪' : serverLabels[serverState].label}</b><code>{backendMode ? 'BACKEND LAB · 答辩实测' : 'FRONTEND ONLY · 非实测'}</code></div>
         <div className="top-actions">
         <LabButton variant="ghost" className="shell-button" onClick={switchExecutionMode} aria-pressed={backendMode}><Presentation /> {backendMode ? '退出答辩模式' : '进入答辩模式'}</LabButton>
-        <LabButton variant="outline" className="shell-button" onClick={() => setResetOpen(true)}><RotateCcw /> 重置实验室</LabButton>
+        <LabButton variant="outline" className="shell-button" onClick={() => setResetOpen(true)}><RotateCcw /> 重置界面状态</LabButton>
 <LabButton variant="ghost" className="shell-button" onClick={toggleTheme} aria-label={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}>{theme === 'dark' ? <Sun /> : <Moon />} {theme === 'dark' ? '浅色' : '深色'}</LabButton>
         </div>
       </header>
@@ -2414,10 +2482,10 @@ export default function Home() {
       <LabMetricStrip metrics={metricStrip} aria-label={backendMode ? '后端数据概览' : '本地数据概览'} />
 
       <div className="content-area">
-        <div className="page-title-row"><div><p><Activity size={14} /> RUSTKV SYSTEMS LAB / {activeNavigation.hint.toUpperCase()}</p><h1>{activeNavigation.label}</h1></div><div className={`last-update ${serverState !== 'ONLINE' ? 'frozen' : ''}`}><LabStatusOrb offline={serverState !== 'ONLINE'} /> {serverState === 'ONLINE' ? (backendMode ? '后端状态 · 刚刚' : '纯前端状态 · 刚刚') : `${serverLabels[serverState].label} · 最后更新 ${lastUpdate}`}</div></div>
+        <div className="page-title-row"><div><p><Activity size={14} /> RUSTKV SYSTEMS LAB / {activeNavigation.hint.toUpperCase()}</p><h1>{activeNavigation.label}</h1></div><div className={`last-update ${serverUnavailable ? 'frozen' : serverPending ? 'pending' : ''}`}><LabStatusOrb offline={serverUnavailable} className={serverPending ? 'warning' : undefined} /> {serverState === 'ONLINE' ? (backendMode ? '后端状态 · 刚刚' : '纯前端状态 · 刚刚') : serverPending ? `${serverLabels[serverState].label} · ${serverLabels[serverState].detail}` : `${serverLabels[serverState].label} · 最后更新 ${lastUpdate}`}</div></div>
 
-        {activeTab === 'overview' && <Overview backendMode={backendMode} serverState={serverState} operations={operations} lastUpdate={lastUpdate} concurrencyStatus={concurrencyStatus} concurrencyFailed={concurrencyFailed} recoveryPhase={recoveryPhase} recoveryLost={recoveryLost} benchmarkStatus={benchmarkStatus} benchmarkSeries={benchmarkSeries} />}
-        {activeTab === 'kv' && <KvOperations backendMode={backendMode} online={serverState === 'ONLINE'} entries={entries} operations={operations} onAction={performKvAction} />}
+        {activeTab === 'overview' && <Overview backendMode={backendMode} serverState={serverState} operations={operations} crudCoverage={crudCoverage} lastUpdate={lastUpdate} concurrencyStatus={concurrencyStatus} concurrencyFailed={concurrencyFailed} recoveryPhase={recoveryPhase} recoveryLost={recoveryLost} benchmarkStatus={benchmarkStatus} benchmarkSeries={benchmarkSeries} />}
+        {activeTab === 'kv' && <KvOperations backendMode={backendMode} serverState={serverState} entries={entries} operations={operations} onAction={performKvAction} />}
         {activeTab === 'concurrency' && <ConcurrencyPage backendMode={backendMode} online={serverState === 'ONLINE'} clients={concurrencyClients} setClients={setConcurrencyClients} requestsPerClient={requestsPerClient} setRequestsPerClient={setRequestsPerClient} workload={concurrencyWorkload} setWorkload={setConcurrencyWorkload} status={concurrencyStatus} progress={concurrencyProgress} successful={concurrencySuccessful} failed={concurrencyFailed} stopping={concurrencyStopping} onStart={startConcurrency} onStop={stopConcurrency} />}
         {activeTab === 'recovery' && <RecoveryPage backendMode={backendMode} serverState={serverState} phase={recoveryPhase} seedCount={recoverySeedCount} setSeedCount={setRecoverySeedCount} actionPending={recoveryActionPending} verifiedBySource={recoveryVerified} beforeCount={recoveryBeforeCount} recoveredCount={recoveredCount} recoveryLost={recoveryLost} progress={recoveryProgress} logs={recoveryLogs} beforeFingerprint={beforeFingerprint} afterFingerprint={afterFingerprint} sampleBefore={recoverySamples} currentEntries={entries} verificationEntries={recoveryVerificationEntries} walReplayCount={walReplayCount} recoveryTime={recoveryTime} onSeed={seedRecoveryData} onKill={killServer} onRestart={restartServer} />}
         {activeTab === 'performance' && <PerformancePage backendMode={backendMode} online={serverState === 'ONLINE'} profile={benchmarkProfile} setProfile={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkProfile(value); setBenchmarkScales(value === 'QUICK' ? [...QUICK_BENCHMARK_SCALES] : [...FULL_BENCHMARK_SCALES]); }} mode={benchmarkMode} setMode={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkMode(value); setBenchmarkPreset(null); }} researchVariable={benchmarkResearchVariable} setResearchVariable={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkResearchVariable(value); setBenchmarkPreset(null); }} runtime={benchmarkRuntime} setRuntime={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkRuntime(value); setBenchmarkPreset(null); }} lock={benchmarkLock} setLock={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkLock(value); setBenchmarkPreset(null); }} scales={benchmarkScales} setScales={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkScales(value); setBenchmarkPreset(null); }} workload={benchmarkWorkload} setWorkload={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkWorkload(value); setBenchmarkPreset(null); }} preset={benchmarkPreset} onApplyPreset={applyBenchmarkPreset} status={benchmarkStatus} progress={benchmarkProgress} series={benchmarkSeries} currentJob={benchmarkCurrentJob} stage={benchmarkStage} environmentResets={benchmarkEnvironmentResets} stopping={benchmarkStopping} onStart={startBenchmark} onStop={stopBenchmark} onRetry={retryFailedBenchmark} />}
@@ -2425,7 +2493,7 @@ export default function Home() {
 
       <AlertDialog open={resetOpen} onOpenChange={setResetOpen}>
         <AlertDialogContent className="reset-dialog">
-          <AlertDialogHeader><AlertDialogTitle>重置当前实验室界面？</AlertDialogTitle><AlertDialogDescription>{backendMode ? '只清空前端实验进度与图表，不删除后端数据、不修改 WAL，也不会切换出答辩模式。' : '清空纯前端实验进度，恢复初始键值与 UI 状态；不会发送任何后端请求。'}</AlertDialogDescription></AlertDialogHeader>
+          <AlertDialogHeader><AlertDialogTitle>重置当前界面状态？</AlertDialogTitle><AlertDialogDescription>{backendMode ? '只清空前端实验进度与图表，不删除后端数据、不修改 WAL，也不会切换出答辩模式。' : '清空纯前端实验进度，恢复初始键值与 UI 状态；不会发送任何后端请求。'}</AlertDialogDescription></AlertDialogHeader>
           <AlertDialogFooter><AlertDialogCancel>取消</AlertDialogCancel><AlertDialogAction onClick={() => resetLab()}><RotateCcw /> 确认重置</AlertDialogAction></AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
