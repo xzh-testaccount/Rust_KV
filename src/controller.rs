@@ -4,7 +4,7 @@
 //! 访问真实 KV 服务，并负责服务器进程、并发实验和崩溃恢复的生命周期。
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     io::{self, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -270,6 +270,18 @@ struct BenchmarkState {
     progress: f64,
     points: Vec<RemoteBenchmarkPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sampling: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requests_per_scale: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at_unix_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at_unix_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     artifact_dir: Option<String>,
@@ -282,6 +294,12 @@ impl Default for BenchmarkState {
             status: "IDLE".to_owned(),
             progress: 0.0,
             points: Vec::new(),
+            mode: None,
+            sampling: None,
+            sample_duration_ms: None,
+            requests_per_scale: None,
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
             error: None,
             artifact_dir: None,
             reset_epoch: 0,
@@ -427,6 +445,9 @@ struct HttpRequest {
 }
 
 fn handle_http_connection(mut stream: TcpStream, inner: Arc<ControllerInner>) -> io::Result<()> {
+    // Windows 上 accept 得到的连接可能继承监听器的非阻塞状态。
+    // HTTP 请求可能分段到达，这里恢复阻塞读取并使用超时保护。
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let response = match read_http_request(&mut stream) {
@@ -1465,14 +1486,60 @@ fn fingerprint(entries: &BTreeMap<String, String>) -> String {
 #[serde(rename_all = "camelCase")]
 struct BenchmarkInput {
     scales: Vec<usize>,
+    #[serde(default)]
+    benchmark_profile: BenchmarkRunProfile,
+    #[serde(default = "default_benchmark_requests")]
     requests_per_scale: usize,
     runtime: String,
     lock: String,
     workload: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BenchmarkRunProfile {
+    Quick,
+    #[default]
+    Full,
+}
+
+impl BenchmarkRunProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Full => "full",
+        }
+    }
+}
+
+const QUICK_BENCHMARK_DURATION_MS: u64 = 3_000;
+
+fn default_benchmark_requests() -> usize {
+    10_000
+}
+
 fn benchmark_capabilities() -> Value {
     json!({
+        "profiles":[
+            {
+                "id":"quick",
+                "label":"快速演示",
+                "scales":[1,128],
+                "sampling":"fixed_duration",
+                "sampleDurationMs":QUICK_BENCHMARK_DURATION_MS,
+                "warmupRuns":0,
+                "measuredRuns":1
+            },
+            {
+                "id":"full",
+                "label":"完整实验",
+                "scales":[1,10,50,100],
+                "sampling":"fixed_requests",
+                "requestsPerScale":10000,
+                "warmupRuns":1,
+                "measuredRuns":5
+            }
+        ],
         "runtimes":[
             {"id":"sync","label":"Sync / Thread-per-connection","available":true},
             {"id":"async","label":"Async / Tokio","available":true}
@@ -1489,13 +1556,10 @@ fn benchmark_capabilities() -> Value {
         "fixedConditions":{
             "datasetKeys":10000,
             "valueBytes":128,
-            "requestsPerScale":10000,
             "persistence":"WAL + flush + sync_data",
             "protocol":"JSON Lines",
             "network":"localhost",
-            "seed":20260902,
-            "warmupRuns":1,
-            "measuredRuns":5
+            "seed":20260902
         }
     })
 }
@@ -1514,23 +1578,44 @@ fn reset_benchmark(inner: &Arc<ControllerInner>) -> std::result::Result<Value, A
         ..BenchmarkState::default()
     };
     inner.benchmark_stop.store(false, Ordering::Relaxed);
-    Ok(json!({"reset":true,"resetEpoch":next_epoch}))
+    Ok(json!({
+        "reset":true,
+        "ready":true,
+        "resetEpoch":next_epoch,
+        "environmentStrategy":"fresh-deterministic-baseline-per-point",
+        "fixedConditions":{
+            "datasetKeys":10000,
+            "valueBytes":128,
+            "seed":20260902,
+            "persistence":"WAL + flush + sync_data",
+            "protocol":"JSON Lines",
+            "network":"localhost"
+        }
+    }))
 }
 
 fn start_benchmark(
     inner: Arc<ControllerInner>,
     input: BenchmarkInput,
 ) -> std::result::Result<(), ApiError> {
-    if input.scales.is_empty()
-        || input
+    let valid_scales = match input.benchmark_profile {
+        BenchmarkRunProfile::Quick => input
             .scales
             .iter()
-            .any(|clients| !(1..=100).contains(clients))
-        || !(1..=100_000).contains(&input.requests_per_scale)
-    {
+            .all(|clients| matches!(clients, 1 | 128)),
+        BenchmarkRunProfile::Full => input
+            .scales
+            .iter()
+            .all(|clients| (1..=100).contains(clients)),
+    };
+    let scales_are_unique =
+        input.scales.iter().copied().collect::<BTreeSet<_>>().len() == input.scales.len();
+    let valid_requests = input.benchmark_profile == BenchmarkRunProfile::Quick
+        || (1..=100_000).contains(&input.requests_per_scale);
+    if input.scales.is_empty() || !valid_scales || !scales_are_unique || !valid_requests {
         return Err(ApiError::bad_request(
             "INVALID_EXPERIMENT_CONFIG",
-            "scales 必须在 1..=100，requestsPerScale 必须在 1..=100000",
+            "quick 只允许 1/128 clients；full 允许 1..=100；scales 不可重复；requestsPerScale 必须在 1..=100000",
         ));
     }
     let runtime = parse_runtime(&input.runtime)?;
@@ -1547,6 +1632,17 @@ fn start_benchmark(
         state.status = "RUNNING".to_owned();
         state.progress = 0.0;
         state.points.clear();
+        state.mode = Some(input.benchmark_profile.as_str().to_owned());
+        state.sampling = Some(match input.benchmark_profile {
+            BenchmarkRunProfile::Quick => "fixed_duration".to_owned(),
+            BenchmarkRunProfile::Full => "fixed_requests".to_owned(),
+        });
+        state.sample_duration_ms = (input.benchmark_profile == BenchmarkRunProfile::Quick)
+            .then_some(QUICK_BENCHMARK_DURATION_MS);
+        state.requests_per_scale = (input.benchmark_profile == BenchmarkRunProfile::Full)
+            .then_some(input.requests_per_scale);
+        state.started_at_unix_ms = Some(unix_millis());
+        state.completed_at_unix_ms = None;
         state.error = None;
         state.artifact_dir = None;
     }
@@ -1568,9 +1664,26 @@ fn run_benchmark_job(
         if inner.benchmark_stop.load(Ordering::Relaxed) {
             if let Ok(mut state) = inner.benchmark.lock() {
                 state.status = "STOPPED".to_owned();
+                state.completed_at_unix_ms = Some(unix_millis());
             }
             return;
         }
+        let (sampling, warmup_runs, measured_runs) = match input.benchmark_profile {
+            BenchmarkRunProfile::Quick => (
+                crate::benchmark::BenchmarkSampling::FixedDuration {
+                    duration: Duration::from_millis(QUICK_BENCHMARK_DURATION_MS),
+                },
+                0,
+                1,
+            ),
+            BenchmarkRunProfile::Full => (
+                crate::benchmark::BenchmarkSampling::FixedRequests {
+                    requests: input.requests_per_scale,
+                },
+                1,
+                5,
+            ),
+        };
         let result = crate::benchmark::run_benchmark(
             crate::benchmark::BenchmarkConfig {
                 server_executable: inner.config.server_executable.clone(),
@@ -1583,12 +1696,12 @@ fn run_benchmark_job(
                     WorkloadProfile::Write => crate::benchmark::BenchmarkWorkload::WriteHeavy,
                 },
                 clients,
-                requests: input.requests_per_scale,
+                sampling,
                 dataset_keys: 10_000,
                 value_bytes: 128,
                 seed: 20_260_902,
-                warmup_runs: 1,
-                measured_runs: 5,
+                warmup_runs,
+                measured_runs,
             },
             Arc::clone(&inner.benchmark_stop),
             {
@@ -1616,6 +1729,25 @@ fn run_benchmark_job(
         );
         match result {
             Ok(outcome) => {
+                if inner.benchmark_stop.load(Ordering::Relaxed) {
+                    if let Ok(mut state) = inner.benchmark.lock() {
+                        state.status = "STOPPED".to_owned();
+                        state.completed_at_unix_ms = Some(unix_millis());
+                    }
+                    return;
+                }
+                if outcome.completed == 0 || outcome.failed > 0 {
+                    if let Ok(mut state) = inner.benchmark.lock() {
+                        state.status = "INTERRUPTED".to_owned();
+                        state.error = Some(format!(
+                            "性能点失败：completed={}，failed={}；未发布曲线数据",
+                            outcome.completed, outcome.failed
+                        ));
+                        state.artifact_dir = Some(outcome.artifact_dir.display().to_string());
+                        state.completed_at_unix_ms = Some(unix_millis());
+                    }
+                    return;
+                }
                 if let Ok(mut state) = inner.benchmark.lock() {
                     state.points.push(RemoteBenchmarkPoint {
                         clients,
@@ -1639,14 +1771,20 @@ fn run_benchmark_job(
                         "INTERRUPTED".to_owned()
                     };
                     state.error = Some(error.to_string());
+                    state.completed_at_unix_ms = Some(unix_millis());
                 }
                 return;
             }
         }
     }
     if let Ok(mut state) = inner.benchmark.lock() {
-        state.status = "COMPLETED".to_owned();
-        state.progress = 100.0;
+        if inner.benchmark_stop.load(Ordering::Relaxed) {
+            state.status = "STOPPED".to_owned();
+        } else {
+            state.status = "COMPLETED".to_owned();
+            state.progress = 100.0;
+        }
+        state.completed_at_unix_ms = Some(unix_millis());
     }
 }
 

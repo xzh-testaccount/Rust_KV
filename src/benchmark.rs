@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Barrier,
+        Arc, Barrier, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -35,6 +35,47 @@ pub enum BenchmarkWorkload {
     WriteHeavy,
 }
 
+/// 单个测量轮次采用的采样方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchmarkSampling {
+    /// 完整实验按固定请求数运行。
+    FixedRequests { requests: usize },
+    /// 快速演示按固定时间运行，请求数由真实吞吐决定。
+    FixedDuration { duration: Duration },
+}
+
+impl BenchmarkSampling {
+    fn profile_name(self) -> &'static str {
+        match self {
+            Self::FixedRequests { .. } => "full",
+            Self::FixedDuration { .. } => "quick",
+        }
+    }
+
+    fn mode_name(self) -> &'static str {
+        match self {
+            Self::FixedRequests { .. } => "fixed_requests",
+            Self::FixedDuration { .. } => "fixed_duration",
+        }
+    }
+
+    fn requests(self) -> Option<usize> {
+        match self {
+            Self::FixedRequests { requests } => Some(requests),
+            Self::FixedDuration { .. } => None,
+        }
+    }
+
+    fn duration_ms(self) -> Option<u64> {
+        match self {
+            Self::FixedRequests { .. } => None,
+            Self::FixedDuration { duration } => {
+                Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            }
+        }
+    }
+}
+
 impl BenchmarkWorkload {
     pub fn read_percent(self) -> u8 {
         match self {
@@ -58,7 +99,7 @@ pub struct BenchmarkConfig {
     pub lock: LockStrategy,
     pub workload: BenchmarkWorkload,
     pub clients: usize,
-    pub requests: usize,
+    pub sampling: BenchmarkSampling,
     pub dataset_keys: usize,
     pub value_bytes: usize,
     pub seed: u64,
@@ -75,7 +116,7 @@ impl Default for BenchmarkConfig {
             lock: LockStrategy::Mutex,
             workload: BenchmarkWorkload::Mixed,
             clients: 1,
-            requests: 10_000,
+            sampling: BenchmarkSampling::FixedRequests { requests: 10_000 },
             dataset_keys: 10_000,
             value_bytes: 128,
             seed: 0x5255_5354_4B56_0001,
@@ -110,7 +151,10 @@ pub struct BenchmarkOutcome {
     pub lock: String,
     pub workload: BenchmarkWorkload,
     pub clients: usize,
-    pub requests_per_run: usize,
+    pub benchmark_profile: String,
+    pub sampling_mode: String,
+    pub requests_per_run: Option<usize>,
+    pub sample_duration_ms: Option<u64>,
     pub measured_runs: Vec<BenchmarkPoint>,
     pub requested: u64,
     pub attempted: u64,
@@ -359,13 +403,23 @@ fn validate_config(config: &BenchmarkConfig) -> Result<(), BenchmarkError> {
     if config.clients == 0 {
         return Err(BenchmarkError::failed("clients must be greater than zero"));
     }
-    if config.requests == 0 {
-        return Err(BenchmarkError::failed("requests must be greater than zero"));
-    }
-    if config.clients > config.requests {
-        return Err(BenchmarkError::failed(
-            "clients cannot exceed requests in one benchmark run",
-        ));
+    match config.sampling {
+        BenchmarkSampling::FixedRequests { requests } => {
+            if requests == 0 {
+                return Err(BenchmarkError::failed("requests must be greater than zero"));
+            }
+            if config.clients > requests {
+                return Err(BenchmarkError::failed(
+                    "clients cannot exceed requests in one benchmark run",
+                ));
+            }
+        }
+        BenchmarkSampling::FixedDuration { duration } if duration.is_zero() => {
+            return Err(BenchmarkError::failed(
+                "sample duration must be greater than zero",
+            ));
+        }
+        BenchmarkSampling::FixedDuration { .. } => {}
     }
     if config.dataset_keys == 0 {
         return Err(BenchmarkError::failed(
@@ -447,25 +501,44 @@ fn execute_clients(
         streams.push(stream);
     }
 
-    let barrier = Arc::new(Barrier::new(config.clients + 1));
+    // 先等所有客户端就绪，再统一开始计时，线程启动时间不计入采样窗口。
+    let ready_barrier = Arc::new(Barrier::new(config.clients + 1));
+    let start_barrier = Arc::new(Barrier::new(config.clients + 1));
+    let shared_deadline = match config.sampling {
+        BenchmarkSampling::FixedRequests { .. } => None,
+        BenchmarkSampling::FixedDuration { .. } => Some(Arc::new(OnceLock::new())),
+    };
     let mut workers = Vec::with_capacity(config.clients);
     let mut first_request = 0_usize;
     for (client, stream) in streams.into_iter().enumerate() {
-        let count = requests_for_client(config.requests, config.clients, client);
-        let start_index = first_request;
-        first_request += count;
-        let barrier = Arc::clone(&barrier);
+        let (start_index, request_count) = match config.sampling {
+            BenchmarkSampling::FixedRequests { requests } => {
+                let count = requests_for_client(requests, config.clients, client);
+                let start_index = first_request;
+                first_request += count;
+                (start_index, Some(count))
+            }
+            BenchmarkSampling::FixedDuration { .. } => (client.saturating_mul(1_000_000_000), None),
+        };
+        let ready_barrier = Arc::clone(&ready_barrier);
+        let start_barrier = Arc::clone(&start_barrier);
+        let shared_deadline = shared_deadline.as_ref().map(Arc::clone);
         let cancelled = Arc::clone(cancelled);
         let workload = config.workload;
         let dataset_keys = config.dataset_keys;
         let value_bytes = config.value_bytes;
         let seed = config.seed;
         workers.push(thread::spawn(move || {
-            barrier.wait();
+            ready_barrier.wait();
+            start_barrier.wait();
+            let deadline = shared_deadline
+                .as_ref()
+                .and_then(|deadline| deadline.get().copied());
             run_client(
                 stream,
                 start_index,
-                count,
+                request_count,
+                deadline,
                 workload,
                 dataset_keys,
                 value_bytes,
@@ -475,8 +548,14 @@ fn execute_clients(
         }));
     }
 
+    ready_barrier.wait();
     let started = Instant::now();
-    barrier.wait();
+    if let (BenchmarkSampling::FixedDuration { duration }, Some(shared_deadline)) =
+        (config.sampling, shared_deadline.as_ref())
+    {
+        let _ = shared_deadline.set(started + duration);
+    }
+    start_barrier.wait();
     let mut aggregate = WorkerResult::default();
     for worker in workers {
         let result = worker
@@ -487,8 +566,11 @@ fn execute_clients(
     let elapsed = started.elapsed();
 
     Ok(RoundResult {
-        requested: u64::try_from(config.requests)
-            .map_err(|_| BenchmarkError::failed("request count overflow"))?,
+        requested: match config.sampling {
+            BenchmarkSampling::FixedRequests { requests } => u64::try_from(requests)
+                .map_err(|_| BenchmarkError::failed("request count overflow"))?,
+            BenchmarkSampling::FixedDuration { .. } => aggregate.attempted,
+        },
         attempted: aggregate.attempted,
         completed: aggregate.completed,
         success: aggregate.success,
@@ -504,7 +586,8 @@ fn execute_clients(
 fn run_client(
     mut stream: TcpStream,
     first_request: usize,
-    request_count: usize,
+    request_count: Option<usize>,
+    deadline: Option<Instant>,
     workload: BenchmarkWorkload,
     dataset_keys: usize,
     value_bytes: usize,
@@ -523,11 +606,20 @@ fn run_client(
     let mut reader = BufReader::new(reader_stream);
     let mut result = WorkerResult::default();
 
-    for request_index in first_request..first_request + request_count {
+    let mut completed_requests = 0_usize;
+    loop {
         if cancelled.load(Ordering::Relaxed) {
             result.cancelled = true;
             break;
         }
+        if request_count.is_some_and(|count| completed_requests >= count)
+            || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            break;
+        }
+
+        let request_index = first_request.wrapping_add(completed_requests);
+        completed_requests = completed_requests.saturating_add(1);
 
         let request = request_for(request_index, workload, dataset_keys, value_bytes, seed);
         let encoded = match encode_request_line(&request) {
@@ -605,7 +697,10 @@ fn summarize(
         lock: lock_arg(&config.lock).to_owned(),
         workload: config.workload,
         clients: config.clients,
-        requests_per_run: config.requests,
+        benchmark_profile: config.sampling.profile_name().to_owned(),
+        sampling_mode: config.sampling.mode_name().to_owned(),
+        requests_per_run: config.sampling.requests(),
+        sample_duration_ms: config.sampling.duration_ms(),
         measured_runs: points,
         requested,
         attempted,
@@ -775,7 +870,10 @@ struct ConfigArtifact {
     read_percent: u8,
     write_percent: u8,
     clients: usize,
-    requests: usize,
+    benchmark_profile: &'static str,
+    sampling_mode: &'static str,
+    requests: Option<usize>,
+    sample_duration_ms: Option<u64>,
     dataset_keys: usize,
     value_bytes: usize,
     seed: u64,
@@ -796,7 +894,10 @@ impl ConfigArtifact {
             read_percent: config.workload.read_percent(),
             write_percent: config.workload.write_percent(),
             clients: config.clients,
-            requests: config.requests,
+            benchmark_profile: config.sampling.profile_name(),
+            sampling_mode: config.sampling.mode_name(),
+            requests: config.sampling.requests(),
+            sample_duration_ms: config.sampling.duration_ms(),
             dataset_keys: config.dataset_keys,
             value_bytes: config.value_bytes,
             seed: config.seed,

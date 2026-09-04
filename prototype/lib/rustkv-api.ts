@@ -31,6 +31,9 @@ export type RemoteBenchmarkPoint = {
   p50: number;
   p95: number;
   p99: number;
+  success: number;
+  failed: number;
+  elapsedMs: number;
 };
 
 export type RemoteBenchmarkState = {
@@ -38,6 +41,13 @@ export type RemoteBenchmarkState = {
   progress: number;
   points: RemoteBenchmarkPoint[];
   error?: string;
+  mode?: 'quick' | 'full';
+  sampling?: 'fixed_duration' | 'fixed_requests';
+  sampleDurationMs?: number;
+  requestsPerScale?: number;
+  resetEpoch: number;
+  startedAtUnixMs?: number;
+  completedAtUnixMs?: number;
 };
 
 export type RemoteRecoveryEvidence = {
@@ -151,7 +161,8 @@ export async function readRemoteConcurrency() {
 
 export async function startRemoteBenchmark(input: {
   clients: number;
-  requests: number;
+  benchmarkProfile: 'quick' | 'full';
+  requests?: number;
   runtime: 'sync' | 'async';
   lock: 'mutex' | 'rwlock';
   workload: 'read' | 'mixed' | 'write';
@@ -160,7 +171,10 @@ export async function startRemoteBenchmark(input: {
     method: 'POST',
     body: JSON.stringify({
       scales: [input.clients],
-      requestsPerScale: input.requests,
+      benchmarkProfile: input.benchmarkProfile,
+      ...(input.benchmarkProfile === 'full'
+        ? { requestsPerScale: input.requests ?? 10_000 }
+        : {}),
       runtime: input.runtime,
       lock: input.lock,
       workload: input.workload,
@@ -177,12 +191,20 @@ export async function stopRemoteBenchmark() {
   return requestJson<{ stopped: boolean }>('/api/benchmark/stop', { method: 'POST' });
 }
 
-export async function resetRemoteBenchmarkEnvironment() {
-  return requestJson<{ reset: boolean }>('/api/benchmark/reset', {
+export async function resetRemoteBenchmarkEnvironment(benchmarkProfile: 'quick' | 'full') {
+  return requestJson<{
+    reset: boolean;
+    ready: boolean;
+    resetEpoch: number;
+    environmentStrategy: string;
+  }>('/api/benchmark/reset', {
     method: 'POST',
     body: JSON.stringify({
+      benchmarkProfile,
       dataset: { size: 10_000, valueSize: 128 },
-      requestsPerScale: 10_000,
+      sampling: benchmarkProfile === 'quick'
+        ? { kind: 'fixed-duration', durationMs: 3_000 }
+        : { kind: 'fixed-requests', requestsPerScale: 10_000 },
       persistence: { wal: true, syncData: true },
       protocol: 'json-lines',
       network: 'localhost',

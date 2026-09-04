@@ -467,6 +467,12 @@ button { cursor: pointer; }
   .experiment-config, .benchmark-config { display: grid; grid-template-columns: 1fr; }.recovery-steps { overflow-x: auto; }.recovery-steps > div { min-width: 118px; }.key-cells { grid-template-columns: 1fr 1fr; }
 }
 
+.benchmark-profile { padding-bottom: 8px; border-bottom: 1px solid #202b36; }
+.benchmark-profile-note { margin: -7px 0 0; color: #607184; font-size: 7px; line-height: 1.5; }
+.scale-selector > div { grid-template-columns: repeat(var(--benchmark-scale-count, 4), 1fr); }
+.scale-series-row { grid-template-columns: 180px repeat(var(--benchmark-scale-count, 4), minmax(150px, 1fr)); }
+.scale-state small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 @media (max-height: 780px) and (min-width: 1081px) {
   .lab-page { height: auto; min-height: 620px; }.content-area { overflow: auto; }.overview-grid { min-height: 620px; }
 }

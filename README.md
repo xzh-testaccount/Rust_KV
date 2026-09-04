@@ -33,7 +33,9 @@ TCP 服务完整支持半包、粘包、CRLF、非法 UTF-8/JSON、超长帧和�
 
 四种组合共用相同协议、数据集和 `WAL → flush → sync_data → Memory` 持久化语义。异步模式把阻塞存储操作放入 `spawn_blocking`；`RwLock` 的 GET/KEYS/STATUS/STORAGE_STATUS 使用读锁，SET/DELETE/COMPACT 使用写锁。
 
-答辩网页通过真实 HTTP 控制器接入。答辩模式的 CRUD、并发计数、Kill/Restart、Snapshot + WAL 恢复、实时存储状态、真实 Compact 和 QPS/P50/P95/P99 都来自后端；后端不可达时返回 `BACKEND_UNREACHABLE`，不会自动降级为模拟数据。Performance Lab 还展示 B 模块基础 WAL 与 Snapshot 压缩版的历史实测柱状图，原始数据保存在 `docs/b_compaction_metrics.json`。
+答辩网页通过真实 HTTP 控制器接入。答辩模式的 CRUD、并发计数、Kill/Restart、Snapshot + WAL 恢复、实时存储状态、真实 Compact 和 QPS/P50/P95/P99 都来自后端；后端不可达时返回 `BACKEND_UNREACHABLE`，不会自动降级为模拟数据。Performance Lab 提供“快速演示”和“完整实验”两档：快速档使用 `1 / 128 Clients`、每点固定采样 3 秒，完整档保留 `1 / 10 / 50 / 100 Clients`、每轮 10,000 请求、预热和 5 轮正式采样。两档均运行真实 Rust 服务，A/B 切换前必须等待控制器确认实验环境已重置。
+
+Performance Lab 还展示 B 模块基础 WAL 与 Snapshot 压缩版的历史实测柱状图，原始数据保存在 `docs/b_compaction_metrics.json`。历史完整数据与本次实时数据分别标注，不混用、不补造。
 
 协议层已经实现了JSON Lines协议同时定义了客户端-服务端请求/响应数据结构，能够对frame进行流式解析，能够自动处理过大帧，完美区分空帧以及不完全的帧。协议层实现了严格的协议校验，能够拒绝非法的数据流，防止注入或者协议污染。
 服务端和客户端实现了异步化的功能，客户端通过tokio实现异步连接服务端，异步打印提示信息，服务端通过tokio实现异步处理客户端的请求，为每一个客户端连接生成了一个独立的异步任务，实现了真正的并发。

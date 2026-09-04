@@ -154,6 +154,7 @@ type Workload = 'READ_HEAVY' | 'MIXED' | 'WRITE_HEAVY';
 type RuntimeModel = 'Sync' | 'Async';
 type LockStrategy = 'Mutex' | 'RwLock';
 type ExperimentMode = 'SINGLE' | 'COMPARE';
+type BenchmarkProfile = 'QUICK' | 'FULL';
 type ResearchVariable = 'RUNTIME' | 'LOCK' | 'WORKLOAD';
 type BenchmarkPreset = 'A' | 'B' | 'C' | null;
 type ScaleStatus = 'WAITING' | 'RUNNING' | 'DONE' | 'FAILED';
@@ -188,9 +189,13 @@ type BenchmarkPoint = {
   p50: number;
   p95: number;
   p99: number;
+  success: number;
+  failed: number;
+  elapsedMs: number;
 };
 
 type BenchmarkConfig = {
+  profile: BenchmarkProfile;
   runtime: RuntimeModel;
   lock: LockStrategy;
   workload: Workload;
@@ -212,8 +217,10 @@ type BenchmarkJob = {
 };
 
 const INITIAL_KEY_COUNT = 327;
-const BENCHMARK_REQUESTS = 10_000;
-const BENCHMARK_SCALES = [1, 10, 50, 100] as const;
+const FULL_BENCHMARK_REQUESTS = 10_000;
+const QUICK_BENCHMARK_DURATION_MS = 3_000;
+const QUICK_BENCHMARK_SCALES = [1, 128] as const;
+const FULL_BENCHMARK_SCALES = [1, 10, 50, 100] as const;
 
 type StorageHistoryBar = {
   id: 'basic' | 'advanced-before' | 'advanced-after';
@@ -396,43 +403,6 @@ function makeScaleStatus(scales: number[]): Record<number, ScaleStatus> {
   return Object.fromEntries(scales.map((scale) => [scale, 'WAITING'])) as Record<number, ScaleStatus>;
 }
 
-function makeBenchmarkPoint(config: BenchmarkConfig, clients: number): BenchmarkPoint {
-  const scaleIndex = BENCHMARK_SCALES.indexOf(clients as (typeof BENCHMARK_SCALES)[number]);
-  const baseThroughput = [1580, 7680, 11_920, 11_180][Math.max(0, scaleIndex)];
-  const baseP99 = [1.35, 3.05, 8.4, 15.2][Math.max(0, scaleIndex)];
-  const concurrencyFactor = config.runtime === 'Async'
-    ? [0.97, 1.04, 1.16, 1.24][Math.max(0, scaleIndex)]
-    : [1.03, 1, 0.9, 0.78][Math.max(0, scaleIndex)];
-  const lockFactor = config.lock === 'RwLock'
-    ? config.workload === 'READ_HEAVY'
-      ? [1.02, 1.08, 1.25, 1.38][Math.max(0, scaleIndex)]
-      : config.workload === 'WRITE_HEAVY'
-        ? [0.99, 0.96, 0.91, 0.87][Math.max(0, scaleIndex)]
-        : [1, 1.03, 1.08, 1.1][Math.max(0, scaleIndex)]
-    : 1;
-  const workloadFactor = config.workload === 'READ_HEAVY' ? 1.16 : config.workload === 'WRITE_HEAVY' ? 0.69 : 1;
-  const qps = Math.round(baseThroughput * concurrencyFactor * lockFactor * workloadFactor);
-  const workloadLatency = config.workload === 'READ_HEAVY' ? 0.82 : config.workload === 'WRITE_HEAVY' ? 1.48 : 1;
-  const runtimeLatency = config.runtime === 'Async'
-    ? [1.04, 0.98, 0.85, 0.78][Math.max(0, scaleIndex)]
-    : [0.96, 1, 1.12, 1.28][Math.max(0, scaleIndex)];
-  const lockLatency = config.lock === 'RwLock'
-    ? config.workload === 'READ_HEAVY'
-      ? [0.98, 0.92, 0.78, 0.68][Math.max(0, scaleIndex)]
-      : config.workload === 'WRITE_HEAVY'
-        ? [1.01, 1.06, 1.16, 1.25][Math.max(0, scaleIndex)]
-        : [1, 0.98, 0.94, 0.92][Math.max(0, scaleIndex)]
-    : 1;
-  const p99 = Number((baseP99 * workloadLatency * runtimeLatency * lockLatency).toFixed(2));
-  return {
-    clients,
-    qps,
-    p50: Number((p99 * 0.22).toFixed(2)),
-    p95: Number((p99 * 0.61).toFixed(2)),
-    p99,
-  };
-}
-
 function buildBenchmarkSeries(
   mode: ExperimentMode,
   researchVariable: ResearchVariable,
@@ -485,12 +455,15 @@ function workloadForApi(workload: Workload): 'read' | 'mixed' | 'write' {
 }
 
 function isValidBenchmarkPoint(point: BenchmarkPoint) {
-  return [point.clients, point.qps, point.p50, point.p95, point.p99].every(Number.isFinite)
+  return [point.clients, point.qps, point.p50, point.p95, point.p99, point.success, point.failed, point.elapsedMs].every(Number.isFinite)
     && point.clients > 0
-    && point.qps >= 0
+    && point.qps > 0
     && point.p50 >= 0
     && point.p50 <= point.p95
-    && point.p95 <= point.p99;
+    && point.p95 <= point.p99
+    && point.success > 0
+    && point.failed === 0
+    && point.elapsedMs > 0;
 }
 
 function Overview({
@@ -1029,6 +1002,8 @@ function StorageInnovationPanels({
 function PerformancePage({
   backendMode,
   online,
+  profile,
+  setProfile,
   mode,
   setMode,
   researchVariable,
@@ -1056,6 +1031,8 @@ function PerformancePage({
 }: {
   backendMode: boolean;
   online: boolean;
+  profile: BenchmarkProfile;
+  setProfile: (value: BenchmarkProfile) => void;
   mode: ExperimentMode;
   setMode: (value: ExperimentMode) => void;
   researchVariable: ResearchVariable;
@@ -1083,8 +1060,9 @@ function PerformancePage({
 }) {
   const running = status === 'RUNNING';
   const controlsLocked = running || stopping;
+  const availableScales = profile === 'QUICK' ? QUICK_BENCHMARK_SCALES : FULL_BENCHMARK_SCALES;
   const toggleScale = (scale: number) => setScales(scales.includes(scale) ? scales.filter((value) => value !== scale) : [...scales, scale].sort((a, b) => a - b));
-  const baseConfig = useMemo<BenchmarkConfig>(() => ({ runtime, lock, workload, requests: BENCHMARK_REQUESTS }), [runtime, lock, workload]);
+  const baseConfig = useMemo<BenchmarkConfig>(() => ({ profile, runtime, lock, workload, requests: FULL_BENCHMARK_REQUESTS }), [profile, runtime, lock, workload]);
   const previewSeries = useMemo(() => buildBenchmarkSeries(mode, researchVariable, baseConfig, scales), [mode, researchVariable, baseConfig, scales]);
   const displayedSeries = series.length ? series : previewSeries;
   const runScales = useMemo(() => {
@@ -1153,7 +1131,9 @@ function PerformancePage({
         researchVariable !== 'RUNTIME' || mode === 'SINGLE' ? series[0].config.runtime : null,
         researchVariable !== 'LOCK' || mode === 'SINGLE' ? series[0].config.lock : null,
         researchVariable !== 'WORKLOAD' || mode === 'SINGLE' ? workloadMeta[series[0].config.workload].label : null,
-        `${formatNumber(series[0].config.requests)} Requests`,
+        series[0].config.profile === 'QUICK'
+          ? `${QUICK_BENCHMARK_DURATION_MS / 1000}s Fixed-time Sampling`
+          : `${formatNumber(series[0].config.requests)} Requests`,
       ].filter(Boolean).join(' · ')
     : '等待运行';
 
@@ -1174,7 +1154,8 @@ function PerformancePage({
     conclusion = `在 ${summaryScale} Clients 下，${findings.join('；')}。`;
   }
 
-  const sourceLabel = backendMode ? '后端实测结果' : '本地实验执行器 · 非实测';
+  const profileLabel = profile === 'QUICK' ? '快速演示 · 3 秒/点' : '完整实验 · 10,000 Requests / Warmup / 5轮';
+  const sourceLabel = backendMode ? `本次实时实验 · ${profileLabel}` : '未接入真实后端 · 禁止模拟数据';
 
   return (
     <section className="performance-page lab-page">
@@ -1185,43 +1166,46 @@ function PerformancePage({
           <div><span className="panel-kicker"><Gauge size={15} /> 可控变量性能实验室</span><h2>固定条件 → 改变一个变量 → 自动运行 → 比较结果</h2></div>
           <span className={`experiment-source ${backendMode ? 'measured' : ''}`}>{sourceLabel}</span>
         </div>
+        <div className="experiment-mode benchmark-profile" aria-label="Benchmark 运行档位"><span>运行档位</span><div><button type="button" className={profile === 'QUICK' ? 'active' : ''} disabled={controlsLocked} aria-pressed={profile === 'QUICK'} onClick={() => setProfile('QUICK')}>快速演示</button><button type="button" className={profile === 'FULL' ? 'active' : ''} disabled={controlsLocked} aria-pressed={profile === 'FULL'} onClick={() => setProfile('FULL')}>完整实验</button></div></div>
+        <p className="benchmark-profile-note">{profile === 'QUICK' ? '高并发 + 3 秒固定时间采样；用于答辩现场实时验证。' : '四档并发 + 固定请求规模 + Warmup + 5 轮正式采样；用于报告与数据归档。'}</p>
         <div className="experiment-mode" aria-label="实验方式"><span>实验方式</span><div><button type="button" className={mode === 'SINGLE' ? 'active' : ''} disabled={controlsLocked} aria-pressed={mode === 'SINGLE'} onClick={() => setMode('SINGLE')}>单次实验</button><button type="button" className={mode === 'COMPARE' ? 'active' : ''} disabled={controlsLocked} aria-pressed={mode === 'COMPARE'} onClick={() => setMode('COMPARE')}>对照实验</button></div></div>
         {mode === 'COMPARE' && <fieldset className="research-variable" disabled={controlsLocked}><legend>研究变量</legend>{(['RUNTIME', 'LOCK', 'WORKLOAD'] as ResearchVariable[]).map((value) => <label key={value}><input type="radio" name="research-variable" checked={researchVariable === value} onChange={() => setResearchVariable(value)} /><span>{researchVariableLabels[value]}</span></label>)}</fieldset>}
         <div className="parameter-grid">
           <fieldset disabled={controlsLocked || mode === 'COMPARE' && researchVariable === 'RUNTIME'}><legend>并发模型</legend>{(['Sync', 'Async'] as RuntimeModel[]).map((value) => <label key={value} aria-label={`${value} 并发模型`}><input type="radio" name="runtime-model" checked={runtime === value} onChange={() => setRuntime(value)} /><span><b>{value}</b><small>{value === 'Sync' ? 'Thread-per-connection' : 'Tokio Runtime'}</small></span></label>)}{mode === 'COMPARE' && researchVariable === 'RUNTIME' && <em>自动比较 Sync / Async</em>}</fieldset>
           <fieldset disabled={controlsLocked || mode === 'COMPARE' && researchVariable === 'LOCK'}><legend>锁策略</legend>{(['Mutex', 'RwLock'] as LockStrategy[]).map((value) => <label key={value} aria-label={`${value} 锁策略`}><input type="radio" name="lock-strategy" checked={lock === value} onChange={() => setLock(value)} /><span><b>{value}</b><small>{value === 'Mutex' ? '互斥访问' : '并发读 / 排他写'}</small></span></label>)}{mode === 'COMPARE' && researchVariable === 'LOCK' && <em>自动比较 Mutex / RwLock</em>}</fieldset>
           <fieldset className="workload-fieldset" disabled={controlsLocked || mode === 'COMPARE' && researchVariable === 'WORKLOAD'}><legend>Workload</legend>{(['READ_HEAVY', 'MIXED', 'WRITE_HEAVY'] as Workload[]).map((value) => <label key={value} aria-label={`${workloadMeta[value].label} ${workloadMeta[value].ratio}`}><input type="radio" name="performance-workload" checked={workload === value} onChange={() => setWorkload(value)} /><span><b>{workloadMeta[value].label}</b><small>{workloadMeta[value].ratio}</small></span></label>)}{mode === 'COMPARE' && researchVariable === 'WORKLOAD' && <em>自动比较三种工作负载</em>}</fieldset>
-          <div className="scale-selector"><span>Clients</span><div>{BENCHMARK_SCALES.map((value) => <button key={value} type="button" className={scales.includes(value) ? 'active' : ''} disabled={controlsLocked} aria-pressed={scales.includes(value)} onClick={() => toggleScale(value)}>{value}</button>)}</div><small>按 1 → 10 → 50 → 100 顺序执行</small></div>
-          <div className="request-summary"><span>Requests / Scale</span><strong>{formatNumber(BENCHMARK_REQUESTS)}</strong><small>每组条件保持一致</small></div>
+          <div className="scale-selector"><span>Clients</span><div style={{ '--benchmark-scale-count': availableScales.length } as CSSProperties}>{availableScales.map((value) => <button key={value} type="button" className={scales.includes(value) ? 'active' : ''} disabled={controlsLocked || profile === 'QUICK'} aria-pressed={scales.includes(value)} onClick={() => toggleScale(value)}>{value}</button>)}</div><small>{profile === 'QUICK' ? '固定按 1 → 128 执行，128 个真实客户端连接' : '按 1 → 10 → 50 → 100 顺序执行'}</small></div>
+          <div className="request-summary"><span>{profile === 'QUICK' ? 'Sampling / Scale' : 'Requests / Scale'}</span><strong>{profile === 'QUICK' ? `${QUICK_BENCHMARK_DURATION_MS / 1000} 秒` : formatNumber(FULL_BENCHMARK_REQUESTS)}</strong><small>{profile === 'QUICK' ? '固定时间，真实请求数由后端决定' : '每组条件保持一致'}</small></div>
         </div>
         <div className="benchmark-actions">
-          <p>{backendMode ? '答辩模式会调用接入层并收集实测 QPS 与延迟分位。' : '纯前端模式只测试实验流程、动画、失败与重试，不代表 RustKV 性能。'}</p>
-          {canResume && <LabButton variant="outline" onClick={onRetry} disabled={!online || stopping}><RefreshCcw /> {hasFailedScale ? 'Retry Failed Scale' : '继续未完成 Scale'}</LabButton>}
-          {running ? <LabButton variant="destructive" onClick={onStop}><Pause /> 停止并保留结果</LabButton> : <LabButton disabled={!online || !scales.length || stopping} onClick={onStart}>{stopping ? <Activity /> : <Play />} {stopping ? '正在停止后端…' : mode === 'COMPARE' ? '运行对照实验' : '运行单次实验'}</LabButton>}
+          <p>{backendMode ? '只调用真实 Rust 后端并收集 QPS 与延迟分位；失败时不会补造曲线。' : '性能实验需要进入答辩模式并连接真实 Rust 后端，不提供前端模拟结果。'}</p>
+          {canResume && <LabButton variant="outline" onClick={onRetry} disabled={!backendMode || !online || stopping}><RefreshCcw /> {hasFailedScale ? 'Retry Failed Scale' : '继续未完成 Scale'}</LabButton>}
+          {running ? <LabButton variant="destructive" onClick={onStop}><Pause /> 停止并保留结果</LabButton> : <LabButton disabled={!backendMode || !online || !scales.length || stopping} onClick={onStart}>{stopping ? <Activity /> : <Play />} {stopping ? '正在停止后端…' : mode === 'COMPARE' ? '运行对照实验' : '运行单次实验'}</LabButton>}
         </div>
       </LabPanel>
 
       <LabPanel className="experiment-presets">
         <LabPanelHeader icon={<Sparkles size={15} />} eyebrow="答辩预设" title="一键装载标准控制变量实验" />
         <div className="preset-cards">
-          <button type="button" className={preset === 'A' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('A')}><span>A</span><div><strong>Sync vs Async</strong><small>固定 Mutex · Mixed · 全部 Clients</small></div></button>
-          <button type="button" className={preset === 'B' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('B')}><span>B</span><div><strong>Mutex vs RwLock</strong><small>固定 Async · Read Heavy · 全部 Clients</small></div></button>
-          <button type="button" className={preset === 'C' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('C')}><span>C</span><div><strong>Workload Comparison</strong><small>固定 Async · RwLock · 全部 Clients</small></div></button>
+          <button type="button" className={preset === 'A' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('A')}><span>A</span><div><strong>Sync vs Async</strong><small>固定 Mutex · Mixed · 当前档位 Clients</small></div></button>
+          <button type="button" className={preset === 'B' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('B')}><span>B</span><div><strong>Mutex vs RwLock</strong><small>固定 Async · Read Heavy · 当前档位 Clients</small></div></button>
+          <button type="button" className={preset === 'C' ? 'active' : ''} disabled={controlsLocked} onClick={() => onApplyPreset('C')}><span>C</span><div><strong>Workload Comparison</strong><small>固定 Async · RwLock · 当前档位 Clients</small></div></button>
         </div>
         <p>RwLock 的潜在优势主要来自并发读；Write Heavy 下不保证优于 Mutex。</p>
       </LabPanel>
 
       <LabPanel className="fixed-conditions">
         <LabPanelHeader icon={<ListChecks size={15} />} eyebrow="Fixed Conditions" title="所有对照组共享同一实验条件" action={<span className="prototype-label">WAL / sync_data 不可切换</span>} />
-        <div><span>Dataset Size</span><strong>10,000 Keys</strong></div><div><span>Value Size</span><strong>128 B</strong></div><div><span>Requests / Scale</span><strong>10,000</strong></div><div><span>Persistence</span><strong>WAL + sync_data</strong></div><div><span>Protocol</span><strong>JSON Lines</strong></div><div><span>Network</span><strong>Localhost</strong></div>
+        <div><span>Dataset Size</span><strong>10,000 Keys</strong></div><div><span>Value Size</span><strong>128 B</strong></div><div><span>Sampling</span><strong>{profile === 'QUICK' ? '3s Fixed-time' : '10,000 Requests'}</strong></div><div><span>Persistence</span><strong>WAL + sync_data</strong></div><div><span>Protocol</span><strong>JSON Lines</strong></div><div><span>Network</span><strong>Localhost</strong></div>
       </LabPanel>
 
       <LabPanel className="scale-runner" aria-live="polite">
         <LabPanelHeader icon={<Activity size={15} />} eyebrow="执行序列" title={stage || '等待运行实验'} action={<div className="runner-progress"><span>{completedSteps} / {totalSteps || displayedSeries.length * scales.length} Steps</span><strong>{Math.round(progress)}%</strong></div>} />
         <div className="scale-series-list">
-          {displayedSeries.map((item, seriesIndex) => <div key={item.id} className="scale-series-row"><div className="series-identity"><i style={{ background: LAB_BENCHMARK_SERIES_COLORS[seriesIndex] }} /><span><strong>{item.label}</strong><small>{item.role}</small></span></div>{runScales.map((scale) => {
+          {displayedSeries.map((item, seriesIndex) => <div key={item.id} className="scale-series-row" style={{ '--benchmark-scale-count': runScales.length } as CSSProperties}><div className="series-identity"><i style={{ background: LAB_BENCHMARK_SERIES_COLORS[seriesIndex] }} /><span><strong>{item.label}</strong><small>{item.role}</small></span></div>{runScales.map((scale) => {
             const scaleStatus = item.scaleStatus[scale] ?? 'WAITING';
-            return <div key={scale} className={`scale-state ${scaleStatus.toLowerCase()}`}><span>{scale}</span>{scaleStatus === 'DONE' ? <CheckCircle2 /> : scaleStatus === 'RUNNING' ? <Activity /> : scaleStatus === 'FAILED' ? <CircleAlert /> : <i />}<small>{scaleStatus}</small></div>;
+            const point = item.points.find((candidate) => candidate.clients === scale);
+            return <div key={scale} className={`scale-state ${scaleStatus.toLowerCase()}`}><span>{scale}</span>{scaleStatus === 'DONE' ? <CheckCircle2 /> : scaleStatus === 'RUNNING' ? <Activity /> : scaleStatus === 'FAILED' ? <CircleAlert /> : <i />}<small>{scaleStatus === 'DONE' && point ? `${formatNumber(point.qps)} req/s · P99 ${point.p99.toFixed(2)} ms` : scaleStatus}</small></div>;
           })}</div>)}
         </div>
         <div className="runner-footer"><span>{currentJob ? `当前：${series.find((item) => item.id === currentJob.seriesId)?.label ?? currentJob.seriesId} · ${currentJob.clients} Clients` : status === 'COMPLETED' ? '全部规模已完成' : status === 'INTERRUPTED' ? '失败点已标记，可单独重试' : status === 'STOPPED' ? '已完成点保留，可继续未完成 Scale' : '运行 A 完成后恢复相同数据环境，再运行 B / C'}</span><span>Environment Resets <b>{environmentResets}</b></span><LabProgress value={progress} /></div>
@@ -1255,7 +1239,7 @@ function PerformancePage({
               <CartesianGrid vertical={false} strokeDasharray="3 5" className="cartesian-grid" />
               <XAxis dataKey="clients" tickLine={false} axisLine={false} />
               <YAxis tickLine={false} axisLine={false} width={34} />
-              <ReferenceLine x={50} stroke="var(--primary)" strokeDasharray="4 5" strokeOpacity={0.24} />
+              {profile === 'FULL' && <ReferenceLine x={50} stroke="var(--primary)" strokeDasharray="4 5" strokeOpacity={0.24} />}
               <ChartTooltip content={<ChartTooltipContent indicator="line" />} />
               <Legend iconType="line" />
               {series.flatMap((item) => [
@@ -1324,11 +1308,12 @@ export default function Home() {
   const [walReplayCount, setWalReplayCount] = useState<number | null>(0);
   const [recoveryTime, setRecoveryTime] = useState(0);
 
+  const [benchmarkProfile, setBenchmarkProfile] = useState<BenchmarkProfile>('QUICK');
   const [benchmarkMode, setBenchmarkMode] = useState<ExperimentMode>('COMPARE');
   const [benchmarkResearchVariable, setBenchmarkResearchVariable] = useState<ResearchVariable>('LOCK');
   const [benchmarkRuntime, setBenchmarkRuntime] = useState<RuntimeModel>('Async');
   const [benchmarkLock, setBenchmarkLock] = useState<LockStrategy>('Mutex');
-  const [benchmarkScales, setBenchmarkScales] = useState<number[]>([...BENCHMARK_SCALES]);
+  const [benchmarkScales, setBenchmarkScales] = useState<number[]>([...QUICK_BENCHMARK_SCALES]);
   const [benchmarkWorkload, setBenchmarkWorkload] = useState<Workload>('READ_HEAVY');
   const [benchmarkPreset, setBenchmarkPreset] = useState<BenchmarkPreset>('B');
   const [benchmarkStatus, setBenchmarkStatus] = useState<ExperimentStatus>('IDLE');
@@ -1358,6 +1343,7 @@ export default function Home() {
   const benchmarkCurrentJobRef = useRef<BenchmarkJob | null>(null);
   const benchmarkCompletedRef = useRef(0);
   const benchmarkTotalRef = useRef(0);
+  const benchmarkResetEpochRef = useRef(0);
 
   const toggleTheme = useCallback(() => {
     applyTheme(getTheme() === 'dark' ? 'light' : 'dark');
@@ -1984,18 +1970,50 @@ export default function Home() {
     benchmarkRunningRef.current = false;
     setBenchmarkStage(message);
     addOperation('BENCH', `${job.seriesId}:${job.clients}`, 'error', 'Scale FAILED · 可重试', '—');
+    setBenchmarkStopping(backendMode);
     benchmarkRunRef.current += 1;
+    void (async () => {
+      let settled = !backendMode;
+      if (backendMode) {
+        try {
+          await stopRemoteBenchmark();
+          for (let attempt = 0; attempt < 300; attempt += 1) {
+            const state = await readRemoteBenchmark();
+            if (state.status !== 'RUNNING') {
+              settled = true;
+              break;
+            }
+            await new Promise((resolve) => window.setTimeout(resolve, 100));
+          }
+        } catch {
+          // 原错误信息已经展示；这里只尽力等待后端停止，绝不补造结果。
+          settled = true;
+        }
+      }
+      if (epoch !== lifecycleEpochRef.current) return;
+      if (!settled) setBenchmarkStage(`${message} · 后端仍在停止，请稍候`);
+      setBenchmarkStopping(!settled);
+      suspendHealthProbeRef.current = false;
+      setBackendProbeEpoch((value) => value + 1);
+    })();
   };
 
   const resetBenchmarkEnvironmentBefore = (job: BenchmarkJob, runId: number, epoch: number, countReset: boolean, readyMessage: string) => {
+    setBenchmarkStage(countReset ? '正在重置实验环境，等待后端确认…' : '正在准备统一实验环境，等待后端确认…');
     void (async () => {
       try {
-        const response = await resetRemoteBenchmarkEnvironment();
+        const targetSeries = benchmarkSeriesRef.current.find((item) => item.id === job.seriesId);
+        if (!targetSeries) {
+          failBenchmarkJob(job, '实验配置丢失，无法重置后端环境', runId, epoch);
+          return;
+        }
+        const response = await resetRemoteBenchmarkEnvironment(targetSeries.config.profile.toLowerCase() as 'quick' | 'full');
         if (runId !== benchmarkRunRef.current || epoch !== lifecycleEpochRef.current) return;
-        if (!response.reset) {
+        if (!response.reset || !response.ready || !Number.isInteger(response.resetEpoch) || response.resetEpoch <= benchmarkResetEpochRef.current) {
           failBenchmarkJob(job, '后端未确认实验环境复位；后续 Scale 未运行', runId, epoch);
           return;
         }
+        benchmarkResetEpochRef.current = response.resetEpoch;
         if (countReset) setBenchmarkEnvironmentResets((value) => value + 1);
         setBenchmarkStage(readyMessage);
         benchmarkTimerRef.current = window.setTimeout(() => runNextBenchmarkJob(runId, epoch), 120);
@@ -2027,16 +2045,13 @@ export default function Home() {
       setBenchmarkStatus('COMPLETED');
       setBenchmarkProgress(100);
       setBenchmarkStage('全部 Scale 完成 · 已生成对照结论');
-      addOperation('BENCH', `${benchmarkTotalRef.current} steps`, 'system', backendMode ? '后端实测完成' : '本地执行器完成 · 非实测', '—');
+      addOperation('BENCH', `${benchmarkTotalRef.current} steps`, 'system', '真实后端实验完成', '—');
+      suspendHealthProbeRef.current = false;
+      setBackendProbeEpoch((value) => value + 1);
       return;
     }
     if (next.seriesId !== job.seriesId) {
-      setBenchmarkStage(backendMode ? '请求后端恢复相同数据集与持久化条件' : '恢复相同数据集与持久化条件，准备下一组');
-      if (!backendMode) {
-        setBenchmarkEnvironmentResets((value) => value + 1);
-        benchmarkTimerRef.current = window.setTimeout(() => runNextBenchmarkJob(runId, epoch), 420);
-        return;
-      }
+      setBenchmarkStage('正在重置实验环境，等待后端确认…');
       resetBenchmarkEnvironmentBefore(next, runId, epoch, true, '后端环境已复位，准备运行下一组');
     } else {
       benchmarkTimerRef.current = window.setTimeout(() => runNextBenchmarkJob(runId, epoch), 120);
@@ -2061,10 +2076,12 @@ export default function Home() {
     benchmarkCurrentJobRef.current = job;
     setBenchmarkCurrentJob(job);
     updateBenchmarkSeries((current) => current.map((item) => item.id === job.seriesId ? { ...item, scaleStatus: { ...item.scaleStatus, [job.clients]: 'RUNNING' } } : item));
-    setBenchmarkStage(`运行 ${targetSeries.label} · ${job.clients} Clients · ${formatNumber(targetSeries.config.requests)} Requests`);
+    setBenchmarkStage(targetSeries.config.profile === 'QUICK'
+      ? `运行 ${targetSeries.label} · ${job.clients} Clients · 3 秒固定时间采样`
+      : `运行 ${targetSeries.label} · ${job.clients} Clients · ${formatNumber(targetSeries.config.requests)} Requests`);
 
     if (!backendMode) {
-      benchmarkTimerRef.current = window.setTimeout(() => completeBenchmarkJob(job, makeBenchmarkPoint(targetSeries.config, job.clients), runId, epoch), 620);
+      failBenchmarkJob(job, '未连接真实 Rust 后端；性能实验已拒绝运行，不生成模拟曲线', runId, epoch);
       return;
     }
 
@@ -2072,7 +2089,8 @@ export default function Home() {
       try {
         const startResponse = await startRemoteBenchmark({
           clients: job.clients,
-          requests: targetSeries.config.requests,
+          benchmarkProfile: targetSeries.config.profile.toLowerCase() as 'quick' | 'full',
+          requests: targetSeries.config.profile === 'FULL' ? targetSeries.config.requests : undefined,
           runtime: targetSeries.config.runtime.toLowerCase() as 'sync' | 'async',
           lock: targetSeries.config.lock.toLowerCase() as 'mutex' | 'rwlock',
           workload: workloadForApi(targetSeries.config.workload),
@@ -2089,6 +2107,18 @@ export default function Home() {
             const state = await readRemoteBenchmark();
             if (runId !== benchmarkRunRef.current || epoch !== lifecycleEpochRef.current) return;
             attempts += 1;
+            const expectedProfile = targetSeries.config.profile.toLowerCase();
+            if (state.mode !== expectedProfile) {
+              failBenchmarkJob(job, `后端返回的实验档位不匹配：期望 ${expectedProfile}，实际 ${state.mode ?? 'missing'}`, runId, epoch);
+              return;
+            }
+            const samplingMatches = targetSeries.config.profile === 'QUICK'
+              ? state.sampling === 'fixed_duration' && state.sampleDurationMs === QUICK_BENCHMARK_DURATION_MS
+              : state.sampling === 'fixed_requests' && state.requestsPerScale === targetSeries.config.requests;
+            if (state.resetEpoch !== benchmarkResetEpochRef.current || !samplingMatches) {
+              failBenchmarkJob(job, '后端结果与本轮 reset 或采样配置不匹配；已拒绝加入曲线', runId, epoch);
+              return;
+            }
             const remotePoint = state.points.find((point) => point.clients === job.clients);
             if (state.status === 'COMPLETED' && remotePoint) {
               completeBenchmarkJob(job, remotePoint, runId, epoch);
@@ -2102,8 +2132,11 @@ export default function Home() {
               failBenchmarkJob(job, state.error ?? `${job.clients} Clients 测试被中断`, runId, epoch);
               return;
             }
-            if (attempts >= 1800) {
-              failBenchmarkJob(job, `${job.clients} Clients 状态轮询超过 15 分钟`, runId, epoch);
+            const maxAttempts = targetSeries.config.profile === 'QUICK' ? 60 : 1800;
+            if (attempts >= maxAttempts) {
+              failBenchmarkJob(job, targetSeries.config.profile === 'QUICK'
+                ? `${job.clients} Clients 快速采样超过 30 秒`
+                : `${job.clients} Clients 状态轮询超过 15 分钟`, runId, epoch);
               return;
             }
             benchmarkTimerRef.current = window.setTimeout(() => void poll(), 500);
@@ -2119,30 +2152,28 @@ export default function Home() {
   }
 
   const startBenchmark = () => {
-    if (serverState !== 'ONLINE' || !benchmarkScales.length || benchmarkStopping) return;
+    if (!backendMode || serverState !== 'ONLINE' || !benchmarkScales.length || benchmarkStopping) return;
     clearTimer(benchmarkTimerRef);
     const epoch = lifecycleEpochRef.current;
     const runId = ++benchmarkRunRef.current;
-    const config: BenchmarkConfig = { runtime: benchmarkRuntime, lock: benchmarkLock, workload: benchmarkWorkload, requests: BENCHMARK_REQUESTS };
+    const config: BenchmarkConfig = { profile: benchmarkProfile, runtime: benchmarkRuntime, lock: benchmarkLock, workload: benchmarkWorkload, requests: FULL_BENCHMARK_REQUESTS };
     const nextSeries = buildBenchmarkSeries(benchmarkMode, benchmarkResearchVariable, config, benchmarkScales);
     const jobs = nextSeries.flatMap((item) => benchmarkScales.map((clients) => ({ seriesId: item.id, clients })));
     benchmarkSeriesRef.current = nextSeries;
     benchmarkQueueRef.current = jobs;
     benchmarkCompletedRef.current = 0;
     benchmarkTotalRef.current = jobs.length;
+    benchmarkResetEpochRef.current = 0;
     benchmarkCurrentJobRef.current = null;
     setBenchmarkSeries(nextSeries);
     setBenchmarkCurrentJob(null);
     benchmarkRunningRef.current = true;
+    suspendHealthProbeRef.current = true;
     setBenchmarkStatus('RUNNING');
     setBenchmarkProgress(0);
     setBenchmarkEnvironmentResets(0);
-    setBenchmarkStage(backendMode ? '请求后端准备统一数据集与固定持久化条件' : '准备统一数据集与固定持久化条件');
-    if (backendMode) {
-      resetBenchmarkEnvironmentBefore(jobs[0], runId, epoch, false, '后端初始环境已准备，开始第一组');
-    } else {
-      benchmarkTimerRef.current = window.setTimeout(() => runNextBenchmarkJob(runId, epoch), 260);
-    }
+    setBenchmarkStage('请求后端准备统一数据集与固定持久化条件');
+    resetBenchmarkEnvironmentBefore(jobs[0], runId, epoch, false, '后端初始环境已准备，开始第一组');
   };
 
   const stopBenchmark = async () => {
@@ -2160,25 +2191,41 @@ export default function Home() {
     setBenchmarkStopping(backendMode);
     addOperation('STOP', 'performance lab', 'system', '已停止并保留完成点', '—');
     if (backendMode) {
+      let settled = false;
       try {
         const response = await stopRemoteBenchmark();
         if (stopEpoch === lifecycleEpochRef.current && !response.stopped) {
           setBenchmarkStage('实验数据已保留，但后端未确认停止');
           addOperation('STOP', 'performance lab', 'error', '后端未确认停止', '—');
         }
+        if (response.stopped) {
+          for (let attempt = 0; attempt < 300; attempt += 1) {
+            const state = await readRemoteBenchmark();
+            if (state.status !== 'RUNNING') {
+              settled = true;
+              break;
+            }
+            await new Promise((resolve) => window.setTimeout(resolve, 100));
+          }
+          if (!settled) throw new RustKvApiError('TIMEOUT', '后端在 30 秒内没有结束当前性能点');
+        }
       } catch {
         if (stopEpoch === lifecycleEpochRef.current) {
-          setBenchmarkStage('实验数据已保留，但后端停止请求失败');
+          setBenchmarkStage('实验数据已保留，但尚未确认后端停止；请稍候或重启控制器');
           addOperation('STOP', 'performance lab', 'error', '后端停止请求失败', '—');
         }
       } finally {
-        if (stopEpoch === lifecycleEpochRef.current) setBenchmarkStopping(false);
+        if (stopEpoch === lifecycleEpochRef.current) {
+          setBenchmarkStopping(!settled);
+          suspendHealthProbeRef.current = false;
+          setBackendProbeEpoch((value) => value + 1);
+        }
       }
     }
   };
 
   const retryFailedBenchmark = () => {
-    if (serverState !== 'ONLINE' || benchmarkStopping) return;
+    if (!backendMode || serverState !== 'ONLINE' || benchmarkStopping) return;
     clearTimer(benchmarkTimerRef);
     const epoch = lifecycleEpochRef.current;
     const runId = ++benchmarkRunRef.current;
@@ -2198,6 +2245,7 @@ export default function Home() {
     benchmarkCompletedRef.current = benchmarkSeriesRef.current.reduce((count, item) => count + Object.values(item.scaleStatus).filter((value) => value === 'DONE').length, 0);
     benchmarkTotalRef.current = benchmarkSeriesRef.current.reduce((count, item) => count + Object.keys(item.scaleStatus).length, 0);
     benchmarkRunningRef.current = true;
+    suspendHealthProbeRef.current = true;
     setBenchmarkStatus('RUNNING');
     setBenchmarkStage(backendMode ? '重试前请求后端恢复统一环境' : '重试前恢复统一环境');
     if (!retryJobs.length) {
@@ -2205,11 +2253,10 @@ export default function Home() {
       setBenchmarkStatus('COMPLETED');
       setBenchmarkProgress(100);
       setBenchmarkStage('没有待重试 Scale');
-    } else if (backendMode) {
-      resetBenchmarkEnvironmentBefore(retryJobs[0], runId, epoch, true, '后端环境已复位，继续未完成 Scale');
+      suspendHealthProbeRef.current = false;
+      setBackendProbeEpoch((value) => value + 1);
     } else {
-      setBenchmarkEnvironmentResets((value) => value + 1);
-      benchmarkTimerRef.current = window.setTimeout(() => runNextBenchmarkJob(runId, epoch), 260);
+      resetBenchmarkEnvironmentBefore(retryJobs[0], runId, epoch, true, '后端环境已复位，继续未完成 Scale');
     }
   };
 
@@ -2217,7 +2264,7 @@ export default function Home() {
     clearBenchmarkResultsForConfigChange();
     setBenchmarkPreset(value);
     setBenchmarkMode('COMPARE');
-    setBenchmarkScales([...BENCHMARK_SCALES]);
+    setBenchmarkScales(benchmarkProfile === 'QUICK' ? [...QUICK_BENCHMARK_SCALES] : [...FULL_BENCHMARK_SCALES]);
     if (value === 'A') {
       setBenchmarkResearchVariable('RUNTIME');
       setBenchmarkRuntime('Sync');
@@ -2296,11 +2343,12 @@ export default function Home() {
     setRecoveryVerificationEntries([]);
     setWalReplayCount(backendMode ? null : 0);
     setRecoveryTime(0);
+    setBenchmarkProfile('QUICK');
     setBenchmarkMode('COMPARE');
     setBenchmarkResearchVariable('LOCK');
     setBenchmarkRuntime('Async');
     setBenchmarkLock('Mutex');
-    setBenchmarkScales([...BENCHMARK_SCALES]);
+    setBenchmarkScales([...QUICK_BENCHMARK_SCALES]);
     setBenchmarkWorkload('READ_HEAVY');
     setBenchmarkPreset('B');
     setBenchmarkStatus('IDLE');
@@ -2372,7 +2420,7 @@ export default function Home() {
         {activeTab === 'kv' && <KvOperations backendMode={backendMode} online={serverState === 'ONLINE'} entries={entries} operations={operations} onAction={performKvAction} />}
         {activeTab === 'concurrency' && <ConcurrencyPage backendMode={backendMode} online={serverState === 'ONLINE'} clients={concurrencyClients} setClients={setConcurrencyClients} requestsPerClient={requestsPerClient} setRequestsPerClient={setRequestsPerClient} workload={concurrencyWorkload} setWorkload={setConcurrencyWorkload} status={concurrencyStatus} progress={concurrencyProgress} successful={concurrencySuccessful} failed={concurrencyFailed} stopping={concurrencyStopping} onStart={startConcurrency} onStop={stopConcurrency} />}
         {activeTab === 'recovery' && <RecoveryPage backendMode={backendMode} serverState={serverState} phase={recoveryPhase} seedCount={recoverySeedCount} setSeedCount={setRecoverySeedCount} actionPending={recoveryActionPending} verifiedBySource={recoveryVerified} beforeCount={recoveryBeforeCount} recoveredCount={recoveredCount} recoveryLost={recoveryLost} progress={recoveryProgress} logs={recoveryLogs} beforeFingerprint={beforeFingerprint} afterFingerprint={afterFingerprint} sampleBefore={recoverySamples} currentEntries={entries} verificationEntries={recoveryVerificationEntries} walReplayCount={walReplayCount} recoveryTime={recoveryTime} onSeed={seedRecoveryData} onKill={killServer} onRestart={restartServer} />}
-        {activeTab === 'performance' && <PerformancePage backendMode={backendMode} online={serverState === 'ONLINE'} mode={benchmarkMode} setMode={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkMode(value); setBenchmarkPreset(null); }} researchVariable={benchmarkResearchVariable} setResearchVariable={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkResearchVariable(value); setBenchmarkPreset(null); }} runtime={benchmarkRuntime} setRuntime={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkRuntime(value); setBenchmarkPreset(null); }} lock={benchmarkLock} setLock={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkLock(value); setBenchmarkPreset(null); }} scales={benchmarkScales} setScales={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkScales(value); setBenchmarkPreset(null); }} workload={benchmarkWorkload} setWorkload={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkWorkload(value); setBenchmarkPreset(null); }} preset={benchmarkPreset} onApplyPreset={applyBenchmarkPreset} status={benchmarkStatus} progress={benchmarkProgress} series={benchmarkSeries} currentJob={benchmarkCurrentJob} stage={benchmarkStage} environmentResets={benchmarkEnvironmentResets} stopping={benchmarkStopping} onStart={startBenchmark} onStop={stopBenchmark} onRetry={retryFailedBenchmark} />}
+        {activeTab === 'performance' && <PerformancePage backendMode={backendMode} online={serverState === 'ONLINE'} profile={benchmarkProfile} setProfile={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkProfile(value); setBenchmarkScales(value === 'QUICK' ? [...QUICK_BENCHMARK_SCALES] : [...FULL_BENCHMARK_SCALES]); }} mode={benchmarkMode} setMode={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkMode(value); setBenchmarkPreset(null); }} researchVariable={benchmarkResearchVariable} setResearchVariable={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkResearchVariable(value); setBenchmarkPreset(null); }} runtime={benchmarkRuntime} setRuntime={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkRuntime(value); setBenchmarkPreset(null); }} lock={benchmarkLock} setLock={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkLock(value); setBenchmarkPreset(null); }} scales={benchmarkScales} setScales={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkScales(value); setBenchmarkPreset(null); }} workload={benchmarkWorkload} setWorkload={(value) => { clearBenchmarkResultsForConfigChange(); setBenchmarkWorkload(value); setBenchmarkPreset(null); }} preset={benchmarkPreset} onApplyPreset={applyBenchmarkPreset} status={benchmarkStatus} progress={benchmarkProgress} series={benchmarkSeries} currentJob={benchmarkCurrentJob} stage={benchmarkStage} environmentResets={benchmarkEnvironmentResets} stopping={benchmarkStopping} onStart={startBenchmark} onStop={stopBenchmark} onRetry={retryFailedBenchmark} />}
       </div>
 
       <AlertDialog open={resetOpen} onOpenChange={setResetOpen}>

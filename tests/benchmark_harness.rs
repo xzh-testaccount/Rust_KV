@@ -6,8 +6,8 @@ use std::{
 
 use rust_kv_store::{
     benchmark::{
-        BenchmarkConfig, BenchmarkPhase, BenchmarkWorkload, percentile_millis, run_benchmark,
-        write_deterministic_baseline,
+        BenchmarkConfig, BenchmarkPhase, BenchmarkSampling, BenchmarkWorkload, percentile_millis,
+        run_benchmark, write_deterministic_baseline,
     },
     persistence::PersistentStore,
     server::{LockStrategy, RuntimeMode},
@@ -48,7 +48,7 @@ fn real_server_run_creates_a_traceable_evidence_bundle() {
         lock: LockStrategy::Mutex,
         workload: BenchmarkWorkload::Mixed,
         clients: 2,
-        requests: 20,
+        sampling: BenchmarkSampling::FixedRequests { requests: 20 },
         dataset_keys: 8,
         value_bytes: 16,
         seed: 42,
@@ -67,6 +67,10 @@ fn real_server_run_creates_a_traceable_evidence_bundle() {
     assert_eq!(outcome.completed, 20);
     assert_eq!(outcome.success, 20);
     assert_eq!(outcome.failed, 0);
+    assert_eq!(outcome.benchmark_profile, "full");
+    assert_eq!(outcome.sampling_mode, "fixed_requests");
+    assert_eq!(outcome.requests_per_run, Some(20));
+    assert_eq!(outcome.sample_duration_ms, None);
     assert!(outcome.throughput_qps > 0.0);
     assert_eq!(outcome.measured_runs.len(), 1);
     assert!(progress.contains(&BenchmarkPhase::Preparing));
@@ -91,4 +95,57 @@ fn real_server_run_creates_a_traceable_evidence_bundle() {
     assert_eq!(summary["failed"], 0);
     assert_eq!(summary["runtime"], "async");
     assert_eq!(summary["lock"], "mutex");
+    assert_eq!(summary["sampling_mode"], "fixed_requests");
+    assert_eq!(summary["benchmark_profile"], "full");
+}
+
+#[test]
+fn fixed_duration_sampling_uses_real_elapsed_time_and_requests() {
+    let temp = tempdir().unwrap();
+    let config = BenchmarkConfig {
+        server_executable: PathBuf::from(env!("CARGO_BIN_EXE_kv-server")),
+        artifact_root: temp.path().join("artifacts"),
+        runtime: RuntimeMode::Async,
+        lock: LockStrategy::RwLock,
+        workload: BenchmarkWorkload::ReadHeavy,
+        clients: 2,
+        sampling: BenchmarkSampling::FixedDuration {
+            duration: std::time::Duration::from_millis(250),
+        },
+        dataset_keys: 32,
+        value_bytes: 16,
+        seed: 42,
+        warmup_runs: 0,
+        measured_runs: 1,
+    };
+
+    let outcome = run_benchmark(config, Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+
+    assert_eq!(outcome.sampling_mode, "fixed_duration");
+    assert_eq!(outcome.benchmark_profile, "quick");
+    assert_eq!(outcome.requests_per_run, None);
+    assert_eq!(outcome.sample_duration_ms, Some(250));
+    assert!(
+        outcome.elapsed_ms >= 200.0,
+        "elapsed={}ms",
+        outcome.elapsed_ms
+    );
+    assert!(
+        outcome.elapsed_ms < 2_000.0,
+        "elapsed={}ms",
+        outcome.elapsed_ms
+    );
+    assert!(outcome.attempted > 0);
+    assert_eq!(outcome.requested, outcome.attempted);
+    assert_eq!(outcome.completed, outcome.attempted);
+    assert_eq!(outcome.success, outcome.attempted);
+    assert_eq!(outcome.failed, 0);
+
+    let config_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(outcome.artifact_dir.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(config_json["sampling_mode"], "fixed_duration");
+    assert_eq!(config_json["benchmark_profile"], "quick");
+    assert_eq!(config_json["sample_duration_ms"], 250);
+    assert!(config_json["requests"].is_null());
 }
